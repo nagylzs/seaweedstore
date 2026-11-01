@@ -30,7 +30,7 @@ func (c *Cluster) Assign(ctx context.Context, opts AssignOptions) (*AssignResult
 			if err != nil {
 				return nil, err
 			}
-			return &AssignResult{Fid: answer.Fid, Addr: answer.Url, PublicAddr: answer.PublicUrl, Count: answer.Count}, nil
+			return &AssignResult{Fid: answer.Fid, Addr: answer.Url, PublicAddr: answer.PublicUrl, Count: answer.Count, opts: opts}, nil
 		}
 		wait := he.RetryAfter
 		if wait <= 0 {
@@ -49,12 +49,19 @@ func (c *Cluster) Assign(ctx context.Context, opts AssignOptions) (*AssignResult
 var quoteEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
 
 // Upload uploads a file to the fid of an AssignResult, and returns what the volume server stored.
-// The name and the content type are optional. Of a name with a path, SeaweedFS keeps only the part
-// after the last slash or backslash.
+// The name and the content type are optional. Of a name with a path, only the part after the last
+// slash or backslash is kept.
 //
-// A negative size means that the size is not known. Otherwise the body must give exactly that many
-// bytes, and the volume server must store them all: Upload fails when it reports another size. (It
-// stores an empty file for the content type application/x-www-form-urlencoded, for example.)
+// A file larger than Options.ChunkSize is uploaded in chunks, each to a fid of its own from Assign
+// with the options of a, and then a manifest of the chunks to the fid of a. The fid stands for the
+// whole file: Get, Stat, ServeFile and Delete handle it like any file, and other SeaweedFS clients
+// read it like any file, because the volume server joins the chunks for them. When the upload fails,
+// Upload deletes the chunks it has uploaded; after a crash, they are left without a reference.
+//
+// A negative size means that the size is not known; then Upload holds up to a chunk in memory.
+// Otherwise the body must give exactly that many bytes, and the volume server must store them all:
+// Upload fails when it reports another size. (It stores an empty file for the content type
+// application/x-www-form-urlencoded, for example.)
 //
 // Only ctx limits the upload: the volume server answers after it has stored all copies, which takes
 // longer for larger files.
@@ -65,6 +72,14 @@ func (c *Cluster) Upload(ctx context.Context, a *AssignResult, body io.Reader, s
 	if _, err := ParseFid(a.Fid); err != nil {
 		return nil, err
 	}
+	if chunkSize := c.options.ChunkSize; chunkSize > 0 && (size < 0 || size > chunkSize) {
+		return c.uploadChunked(ctx, a, body, size, name, contentType)
+	}
+	return c.uploadFile(ctx, a, body, size, name, contentType, "")
+}
+
+// uploadFile uploads a body as it is to the fid of a, with query in the URL.
+func (c *Cluster) uploadFile(ctx context.Context, a *AssignResult, body io.Reader, size int64, name, contentType, query string) (*UploadResult, error) {
 	header := http.Header{}
 	if name != "" {
 		header.Set("Content-Disposition", `attachment; filename="`+quoteEscaper.Replace(name)+`"`)
@@ -72,7 +87,11 @@ func (c *Cluster) Upload(ctx context.Context, a *AssignResult, body io.Reader, s
 	if contentType != "" {
 		header.Set("Content-Type", contentType)
 	}
-	res, err := c.send(ctx, http.MethodPut, "http://"+a.Addr+"/"+a.Fid, header, body, size, 0)
+	url := "http://" + a.Addr + "/" + a.Fid
+	if query != "" {
+		url += "?" + query
+	}
+	res, err := c.send(ctx, http.MethodPut, url, header, body, size, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -90,12 +109,13 @@ func (c *Cluster) Upload(ctx context.Context, a *AssignResult, body io.Reader, s
 	return &UploadResult{Name: answer.Name, Size: answer.Size, ETag: answer.ETag, ContentType: answer.Mime}, nil
 }
 
-// Get reads a file from a volume server that has a copy (see fileRequest). The header, with Range or
-// If-None-Match for example, is sent with the request. It returns the response for success and
+// Get reads a file from a volume server that has a copy (see fileRequest), or from the chunks of a
+// file that Upload stored in chunks (see open). The header, with Range or If-None-Match for example,
+// is sent with the request; a Range with several ranges is left out. It returns the response for success and
 // redirect statuses, also for 206 and 304; you must close its body. It returns ErrNotFound when no
 // copy has the file, and an *HTTPError for other error statuses.
 func (c *Cluster) Get(ctx context.Context, fid string, header http.Header) (*http.Response, error) {
-	res, err := c.fileRequest(ctx, http.MethodGet, fid, header)
+	res, err := c.open(ctx, http.MethodGet, fid, header)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +130,7 @@ func (c *Cluster) Get(ctx context.Context, fid string, header http.Header) (*htt
 // ErrNotFound.
 func (c *Cluster) Stat(ctx context.Context, fid string) (*FileInfo, error) {
 	// With gzip, SeaweedFS would send the compressed size, and net/http would drop it.
-	res, err := c.fileRequest(ctx, http.MethodHead, fid, http.Header{"Accept-Encoding": {"identity"}})
+	res, err := c.open(ctx, http.MethodHead, fid, http.Header{"Accept-Encoding": {"identity"}})
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +155,7 @@ func (c *Cluster) Stat(ctx context.Context, fid string) (*FileInfo, error) {
 // Delete deletes a file from a volume server that has a copy (see fileRequest), which deletes the
 // other copies too. It returns ErrNotFound when no copy has the file.
 func (c *Cluster) Delete(ctx context.Context, fid string) error {
-	res, err := c.fileRequest(ctx, http.MethodDelete, fid, nil)
+	res, err := c.fileRequest(ctx, http.MethodDelete, fid, "", nil)
 	if err != nil {
 		return err
 	}
@@ -146,12 +166,13 @@ func (c *Cluster) Delete(ctx context.Context, fid string) error {
 	return nil
 }
 
-// fileRequest sends a request for a file to the volume servers that have a copy, one after the
-// other, until one answers with a status other than 404 or 5xx, and returns that response. A volume
+// fileRequest sends a request for a file, with query in the URL, to the volume servers that have a
+// copy, one after the other, until one answers with a status other than 404 or 5xx, and returns that
+// response. A volume
 // server that a request couldn't reach recently comes last (see tryOrder). Options.VolumeTimeout
 // limits the wait for each one's response headers. It returns ErrNotFound when the volume doesn't
 // exist or every copy answered 404, and the error of each copy otherwise.
-func (c *Cluster) fileRequest(ctx context.Context, method, fid string, header http.Header) (*http.Response, error) {
+func (c *Cluster) fileRequest(ctx context.Context, method, fid, query string, header http.Header) (*http.Response, error) {
 	volumeID, err := ParseFid(fid)
 	if err != nil {
 		return nil, err
@@ -163,7 +184,11 @@ func (c *Cluster) fileRequest(ctx context.Context, method, fid string, header ht
 	var errs []error
 	notFound := 0
 	for _, loc := range c.tryOrder(locations) {
-		res, err := c.send(ctx, method, loc.URL("/"+fid), header, nil, 0, c.options.VolumeTimeout)
+		url := loc.URL("/" + fid)
+		if query != "" {
+			url += "?" + query
+		}
+		res, err := c.send(ctx, method, url, header, nil, 0, c.options.VolumeTimeout)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, err

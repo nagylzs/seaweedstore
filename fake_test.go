@@ -5,11 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -372,4 +376,160 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// memStore keeps the files of memVolumes, which can share it like copies of a volume.
+type memStore struct {
+	mu    sync.Mutex
+	files map[string]*memFile // fid -> file
+	fail  map[string]int      // fid -> HTTP status to answer to an upload
+}
+
+type memFile struct {
+	data        []byte
+	contentType string
+	name        string
+	manifest    bool // uploaded with ?cm=true
+	modified    time.Time
+}
+
+func newMemStore() *memStore {
+	return &memStore{files: map[string]*memFile{}, fail: map[string]int{}}
+}
+
+func (s *memStore) file(fid string) *memFile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.files[fid]
+}
+
+// memVolume is a fake volume server that keeps what is uploaded to it in a memStore, and serves it
+// with Range, If-Range and If-None-Match (by http.ServeContent). Like SeaweedFS, it sends a manifest
+// as it is stored for ?cm=false, and otherwise the file of its chunks, which it joins for a GET
+// request (HTTP 500 if one is missing), but not for a HEAD request. It deletes the chunks of a
+// manifest with it.
+type memVolume struct {
+	*fakeServer // only for its requests and address
+	store       *memStore
+}
+
+func newMemVolume(t *testing.T, store *memStore) *memVolume {
+	v := &memVolume{store: store}
+	v.fakeServer = &fakeServer{answers: map[string]answer{}, queued: map[string][]answer{}}
+	v.srv = httptest.NewServer(http.HandlerFunc(v.serve))
+	t.Cleanup(v.srv.Close)
+	return v
+}
+
+func (v *memVolume) serve(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	v.mu.Lock()
+	v.requests = append(v.requests, request{method: r.Method, path: r.URL.Path, query: r.URL.RawQuery,
+		header: r.Header.Clone(), body: string(body), contentLength: r.ContentLength})
+	v.mu.Unlock()
+	fid := strings.TrimPrefix(r.URL.Path, "/")
+	s := v.store
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f := s.files[fid]
+	switch r.Method {
+	case http.MethodPut:
+		if status := s.fail[fid]; status != 0 {
+			http.Error(w, `{"error":"failed"}`, status)
+			return
+		}
+		f = &memFile{data: body, contentType: r.Header.Get("Content-Type"), manifest: r.URL.Query().Get("cm") == "true",
+			modified: time.Now().Truncate(time.Second)}
+		if _, params, err := mime.ParseMediaType(r.Header.Get("Content-Disposition")); err == nil {
+			f.name = params["filename"]
+		}
+		s.files[fid] = f
+		name := f.name
+		if name == "" {
+			name = fid
+		}
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{"name": name, "size": len(body), "eTag": f.etag(), "mime": f.contentType})
+	case http.MethodGet, http.MethodHead:
+		if f == nil {
+			http.Error(w, "", http.StatusNotFound)
+			return
+		}
+		if f.manifest && r.URL.Query().Get("cm") != "false" {
+			var m chunkManifest
+			json.Unmarshal(f.data, &m)
+			w.Header().Set("X-File-Store", "chunked")
+			w.Header().Set("Content-Type", m.Mime)
+			w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": m.Name}))
+			w.Header().Set("Etag", `"`+f.etag()+`"`)
+			if r.Method == http.MethodHead {
+				w.Header().Set("Content-Length", strconv.FormatInt(m.Size, 10))
+				w.Header().Set("Last-Modified", f.modified.UTC().Format(http.TimeFormat))
+				return
+			}
+			var joined []byte
+			for _, ch := range m.Chunks {
+				cf := s.files[ch.Fid]
+				if cf == nil {
+					http.Error(w, "missing chunk", http.StatusInternalServerError)
+					return
+				}
+				joined = append(joined, cf.data...)
+			}
+			http.ServeContent(w, r, "", f.modified, bytes.NewReader(joined))
+			return
+		}
+		if f.contentType != "" {
+			w.Header().Set("Content-Type", f.contentType)
+		}
+		name := f.name
+		if name == "" {
+			name = fid
+		}
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": name}))
+		w.Header().Set("Etag", `"`+f.etag()+`"`)
+		http.ServeContent(w, r, "", f.modified, bytes.NewReader(f.data))
+	case http.MethodDelete:
+		if f == nil {
+			http.Error(w, `{"size":0}`, http.StatusNotFound)
+			return
+		}
+		delete(s.files, fid)
+		if f.manifest {
+			var m chunkManifest
+			json.Unmarshal(f.data, &m)
+			for _, ch := range m.Chunks {
+				delete(s.files, ch.Fid)
+			}
+		}
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"size":%d}`, len(f.data))
+	}
+}
+
+func (f *memFile) etag() string {
+	return fmt.Sprintf("%08x", crc32.ChecksumIEEE(f.data))
+}
+
+// memCluster returns a ready test cluster whose leader lists volume 3 on the given servers, all in
+// data center dc1, and assigns 100 fids on volume 3 on the first of them. It also returns the leader.
+func memCluster(t *testing.T, opts Options, servers ...string) (*Cluster, *fakeServer) {
+	return memClusterLayout(t, opts, servers[0], layout{"dc1": {"rack1": func() map[string][]int {
+		m := map[string][]int{}
+		for _, s := range servers {
+			m[s] = []int{3}
+		}
+		return m
+	}()}})
+}
+
+// memClusterLayout is memCluster with the volume servers in l, and fids assigned on upload.
+func memClusterLayout(t *testing.T, opts Options, upload string, l layout) (*Cluster, *fakeServer) {
+	leader := newMaster(t, true)
+	leader.answer("/vol/status", http.StatusOK, volStatus(l))
+	for i := range 100 {
+		leader.answerFirst("/dir/assign", answer{status: http.StatusOK,
+			body: fmt.Sprintf(`{"fid":"3,%02x0000abcd","url":"%s","publicUrl":"%s","count":1}`, i+1, upload, upload)})
+	}
+	return readyCluster(t, opts, leader), leader
 }

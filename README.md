@@ -31,6 +31,9 @@ example in a database row. If you need directories and paths, use the SeaweedFS 
   to the next one.
 * A master or a volume server that a request couldn't reach is tried last for the next 30 seconds, so that only
   one request waits for a server that is down.
+* A file larger than `Options.ChunkSize` (defaults to 32 MB) is uploaded in chunks, each to a fid of its own,
+  and a manifest of the chunks to the file's fid. The library reads the chunks itself, each like a file, so a
+  large file is read from the local data center and survives a volume server that is down like a small one.
 
 ## How to use
 
@@ -97,11 +100,12 @@ func main() {
 | `StatusUpdateInterval` | 5 s     | The time between status updates, and the limit for each. After a failed update, the next one comes after a second, if that is shorter. |
 | `Timeout`              | 5 s     | The limit for each request to a master, including reading the answer.            |
 | `VolumeTimeout`        | 10 s    | The limit for the wait for a volume server's response headers when reading or deleting a file. After it, the next copy is tried. |
+| `ChunkSize`            | 32 MB   | Files larger than this are uploaded in chunks of this size (see Uploads). It must not be larger than the volume servers' `-fileSizeLimitMB`. Negative means never. |
 | `DataCenter`           | ""      | The data center to read from first, for example the one closest to your program. Its copies are tried before the others. |
 | `HTTPClient`           | nil     | The `*http.Client` that sends all requests, for TLS settings, proxies or connection limits. nil means a client on `http.DefaultTransport`. Its `Timeout` must be zero. |
 | `Logger`               | nil     | The `*slog.Logger` that failed status updates are logged to. nil means `slog.Default()`. |
 
-A zero duration means the default.
+A zero duration or `ChunkSize` means the default.
 
 ### Cluster
 
@@ -156,14 +160,36 @@ mux.HandleFunc("GET /files/{id}", func(w http.ResponseWriter, r *http.Request) {
   from the volume server.
 * When it returns an error, it has written nothing, so you can answer it, or try another cluster, for example
   one that has backup copies. Once it has started the answer, it returns nil, even if the client went away.
+* A request with several ranges gets the whole file, as RFC 9110 allows.
 
 ### Uploads
 
 `Upload` sends `size` as the length of the body, and the body must give exactly that many bytes. A negative `size`
-means that the size is not known, and the body is sent in chunks. The volume server reports how many bytes it
-stored, and `Upload` fails if that is not `size`.
+means that the size is not known. The volume server reports how many bytes it stored, and `Upload` fails if that
+is not `size`.
 
-SeaweedFS has some surprises here, which were checked with SeaweedFS 4.50:
+#### Large files
+
+A file larger than `Options.ChunkSize` (32 MB by default) is uploaded in chunks. Each chunk goes to a fid of its
+own, which `Upload` assigns with the `AssignOptions` of the file's fid, and then a SeaweedFS chunk manifest, which
+lists the chunks, goes to the file's fid. You keep only that fid:
+
+* `Get`, `Stat`, `ServeFile` and `Delete` handle it like any file. The library reads the chunks itself, each from
+  a copy in `Options.DataCenter` first, and from another copy when one can't be reached, so only the chunks that a
+  range needs are read.
+* Other SeaweedFS clients read the fid like any file: the volume server joins the chunks for them. But it picks a
+  copy of each chunk at random, and doesn't try another: after a volume server was killed, half of such reads
+  failed for at least 45 seconds once, because the joining server still had the killed one.
+* Deleting the file deletes its chunks too.
+* With an unknown size, `Upload` holds up to a chunk in memory, to find out whether the file needs chunks.
+  Otherwise it streams the body.
+* When an upload in chunks fails, `Upload` deletes the chunks it has uploaded. If the program crashes in the
+  middle of it, the chunks are left, and nothing refers to them.
+* A file in chunks is sent uncompressed, also to clients that accept gzip.
+* A chunk manifest that another tool stored, for example `weed upload -maxMB`, is read by the volume server for a
+  range and for `Stat`. A GET request without a range gets the manifest as it is stored.
+
+SeaweedFS has some other surprises with uploads, which were checked with SeaweedFS 4.50:
 
 * Of a file name with a path, it keeps only the part after the last `/` or `\`, so `C:\docs\a.txt` becomes
   `a.txt`. Other characters, including quotes and UTF-8, are kept. Responses to `Get` have the name in their
@@ -172,8 +198,8 @@ SeaweedFS has some surprises here, which were checked with SeaweedFS 4.50:
   answers that the upload succeeded. `Upload` notices that from the size.
 * For a file uploaded without a content type, or as `application/octet-stream`, the volume server guesses one
   when it sends the file, for example `text/plain; charset=utf-8` for text.
-* The volume servers accept files up to their `-fileSizeLimitMB` (256 MB by default). It can be raised, but a
-  volume server holds each upload in memory. seaweedstore doesn't split larger files.
+* The volume servers accept files up to their `-fileSizeLimitMB` (256 MB by default), and hold each upload in
+  memory. The limit applies to each chunk of a large file.
 
 ### Timeouts
 

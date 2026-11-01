@@ -26,7 +26,8 @@ var keptHeaders = []string{"Content-Type", "Content-Disposition"}
 // ETag, Last-Modified and Accept-Ranges always come from the volume server, and ServeFile adds
 // Vary: Accept-Encoding.
 //
-// A range is always asked for without compression, because SeaweedFS answers a range request with
+// A request with several ranges gets the whole file, as RFC 9110 allows. A range is always asked for
+// without compression, because SeaweedFS answers a range request with
 // gzip with a range of the compressed file, under the same ETag as the uncompressed one. Without an
 // Accept-Encoding from the client, the file is asked for without compression too, so that net/http
 // doesn't decompress it unasked.
@@ -50,7 +51,7 @@ func (c *Cluster) ServeFile(w http.ResponseWriter, r *http.Request, fid string) 
 	if header.Get("Range") != "" || header.Get("Accept-Encoding") == "" {
 		header.Set("Accept-Encoding", "identity")
 	}
-	res, err := c.fileRequest(r.Context(), r.Method, fid, header)
+	res, err := c.open(r.Context(), r.Method, fid, header)
 	if err != nil {
 		return err
 	}

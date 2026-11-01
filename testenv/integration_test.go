@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"mime"
 	"net/http"
 	"net/http/httptest"
@@ -203,6 +204,131 @@ func TestServeFile(t *testing.T) {
 	}
 }
 
+// randomData returns n random bytes, the same in every run.
+func randomData(n int) []byte {
+	data := make([]byte, n)
+	rand.NewChaCha8([32]byte{1}).Read(data)
+	return data
+}
+
+// chunksOf returns the chunk fids of a manifest, read from a volume server as it is stored.
+func chunksOf(t *testing.T, c *seaweedstore.Cluster, fid string) []string {
+	t.Helper()
+	locations := lookup(t, c, fid)
+	res, err := http.Get(locations[0].URL("/" + fid + "?cm=false"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var m struct{ Chunks []struct{ Fid string } }
+	if err := json.NewDecoder(res.Body).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	var fids []string
+	for _, ch := range m.Chunks {
+		fids = append(fids, ch.Fid)
+	}
+	return fids
+}
+
+func lookup(t *testing.T, c *seaweedstore.Cluster, fid string) []seaweedstore.VolumeLocation {
+	t.Helper()
+	volumeID, err := seaweedstore.ParseFid(fid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locations, err := c.LookupVolume(context.Background(), volumeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return locations
+}
+
+// A file larger than ChunkSize is uploaded in chunks, with a known and an unknown size. It reads back
+// whole and in ranges across chunks, also by other clients, for which the volume server joins the
+// chunks. Delete deletes the chunks too.
+func TestLargeFile(t *testing.T) {
+	cluster(t, "up")
+	c := newClusterOpts(t, seaweedstore.Options{StatusUpdateInterval: time.Second, ChunkSize: 1 << 20})
+	ctx := context.Background()
+	data := randomData(3500000)
+	for _, size := range []int64{int64(len(data)), -1} {
+		ar := assign(t, c, 10*time.Second)
+		ur, err := c.Upload(ctx, ar, io.MultiReader(bytes.NewReader(data)), size, "big.bin", "application/octet-stream")
+		if err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		if ur.Size != int64(len(data)) || ur.Name != "big.bin" {
+			t.Errorf("size %d: Upload = %+v", size, *ur)
+		}
+		chunks := chunksOf(t, c, ar.Fid)
+		if len(chunks) != 4 {
+			t.Errorf("size %d: %d chunks, want 4", size, len(chunks))
+		}
+
+		if body := readBody(t, get(t, c, ar.Fid, nil)); body != string(data) {
+			t.Errorf("size %d: Get gave %d bytes, not the uploaded ones", size, len(body))
+		}
+		res := get(t, c, ar.Fid, http.Header{"Range": {"bytes=1048570-1048585"}})
+		if body := readBody(t, res); res.StatusCode != http.StatusPartialContent || body != string(data[1048570:1048586]) ||
+			res.Header.Get("Content-Range") != "bytes 1048570-1048585/3500000" {
+			t.Errorf("size %d: range across chunks: %s, %d bytes, Content-Range %q", size, res.Status, len(body), res.Header.Get("Content-Range"))
+		}
+		info, err := c.Stat(ctx, ar.Fid)
+		if err != nil || info.Size != int64(len(data)) || info.Name != "big.bin" || info.ETag != ur.ETag {
+			t.Errorf("size %d: Stat = %+v, %v", size, info, err)
+		}
+		// Another client gets the file joined by the volume server
+		other, err := http.Get(lookup(t, c, ar.Fid)[0].URL("/" + ar.Fid))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body := readBody(t, other); body != string(data) {
+			t.Errorf("size %d: a plain GET gave %d bytes, not the uploaded ones", size, len(body))
+		}
+		other.Body.Close()
+
+		if err := c.Delete(ctx, ar.Fid); err != nil {
+			t.Fatal(err)
+		}
+		for _, chunk := range chunks {
+			if _, err := c.Get(ctx, chunk, nil); !errors.Is(err, seaweedstore.ErrNotFound) {
+				t.Errorf("size %d: Get of chunk %s after Delete returned %v", size, chunk, err)
+			}
+		}
+	}
+}
+
+// When a volume server with copies of chunks is killed, the file is read from the other copies. The
+// cluster here updates its status only every minute, so it still lists the killed server, as it
+// would right after a crash. Only the first read waits for it.
+func TestLargeFileWhileVolumeServerIsKilled(t *testing.T) {
+	cluster(t, "up")
+	data := randomData(3500000)
+	writer := newClusterOpts(t, seaweedstore.Options{StatusUpdateInterval: time.Second, ChunkSize: 1 << 20})
+	ar := assign(t, writer, 10*time.Second)
+	if _, err := writer.Upload(context.Background(), ar, bytes.NewReader(data), int64(len(data)), "big.bin", ""); err != nil {
+		t.Fatal(err)
+	}
+	c := newClusterOpts(t, seaweedstore.Options{StatusUpdateInterval: time.Minute})
+	killed := volumeServer(t, lookup(t, c, chunksOf(t, c, ar.Fid)[0])[0].Addr)
+	cluster(t, "kill", killed.name)
+	t.Cleanup(func() { cluster(t, "up") })
+	slow := 0
+	for i := range 10 {
+		start := time.Now()
+		if body := readBody(t, get(t, c, ar.Fid, nil)); body != string(data) {
+			t.Fatalf("read %d while %s is killed gave %d bytes, not the uploaded ones", i+1, killed.name, len(body))
+		}
+		if time.Since(start) > 2*time.Second {
+			slow++
+		}
+	}
+	if slow > 1 {
+		t.Errorf("%d of 10 reads took more than 2 seconds", slow)
+	}
+}
+
 // File names that need quoting come back unchanged. Of a name with a path, SeaweedFS keeps only the
 // part after the last slash or backslash.
 func TestFileNames(t *testing.T) {
@@ -363,12 +489,15 @@ func cluster(t *testing.T, args ...string) {
 // test ends, and logs to the test.
 func newCluster(t *testing.T, interval time.Duration) *seaweedstore.Cluster {
 	t.Helper()
-	opts := seaweedstore.Options{
-		Logger:               slog.New(slog.NewTextHandler(t.Output(), nil)),
-		StatusUpdateInterval: interval,
-		Timeout:              2 * time.Second,
-		VolumeTimeout:        5 * time.Second,
-	}
+	return newClusterOpts(t, seaweedstore.Options{StatusUpdateInterval: interval})
+}
+
+// newClusterOpts is newCluster with options, to which it adds the logger and the timeouts.
+func newClusterOpts(t *testing.T, opts seaweedstore.Options) *seaweedstore.Cluster {
+	t.Helper()
+	opts.Logger = slog.New(slog.NewTextHandler(t.Output(), nil))
+	opts.Timeout = 2 * time.Second
+	opts.VolumeTimeout = 5 * time.Second
 	var addrs []string
 	for _, m := range masters {
 		addrs = append(addrs, m.addr)

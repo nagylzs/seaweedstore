@@ -31,6 +31,10 @@ type Options struct {
 	// VolumeTimeout limits the wait for a volume server's response headers when reading or deleting a
 	// file, after which the next copy is tried. Zero means 10 seconds.
 	VolumeTimeout time.Duration
+	// ChunkSize is the size above which Upload splits a file into chunks, and the size of the chunks.
+	// It must not be larger than the volume servers' -fileSizeLimitMB. Zero means 32 MB, and a negative
+	// size means that files are never split.
+	ChunkSize int64
 	// DataCenter is the data center to read from first. Reads and deletes try the copies in it before
 	// the others, for example to read from the closest copy. Empty means no preference.
 	DataCenter string
@@ -94,6 +98,8 @@ type AssignResult struct {
 	Addr       string // the volume server, host:port
 	PublicAddr string // the volume server's public address, host:port
 	Count      int    // how many fids are assigned, see AssignOptions.Count
+
+	opts AssignOptions // of Assign, for the chunks of a large file
 }
 
 // UploadResult is what the volume server answered to an upload.

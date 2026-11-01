@@ -21,7 +21,8 @@ func TestAssign(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := AssignResult{Fid: "5,01694433fe", Addr: "172.29.0.21:8080", PublicAddr: "vol1.example.com:8080", Count: 2}
+	want := AssignResult{Fid: "5,01694433fe", Addr: "172.29.0.21:8080", PublicAddr: "vol1.example.com:8080", Count: 2,
+		opts: AssignOptions{Collection: "photos", Count: 2}}
 	if *ar != want {
 		t.Errorf("Assign = %+v, want %+v", *ar, want)
 	}
@@ -211,16 +212,30 @@ func TestUploadWrongLength(t *testing.T) {
 	}
 }
 
-// A negative size sends the body in chunks.
+// With a negative size, a file smaller than a chunk is read first, and uploaded with its length.
+// Without chunks, it is sent with chunked transfer encoding.
 func TestUploadUnknownLength(t *testing.T) {
-	vol, ar := uploadServer(t)
-	c := newTestCluster(t, quietOptions())
-	body := io.MultiReader(strings.NewReader("hello world"))
-	if _, err := c.Upload(context.Background(), ar, body, -1, "hello.txt", "text/plain"); err != nil {
-		t.Fatal(err)
-	}
-	if r := onlyRequest(t, vol, "/"+fid); !r.chunked || r.body != "hello world" {
-		t.Errorf("the upload is %+v, want hello world in chunks", r)
+	for _, tt := range []struct {
+		name      string
+		chunkSize int64
+		chunked   bool
+	}{
+		{"chunk size", 0, false},
+		{"no chunks", -1, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			vol, ar := uploadServer(t)
+			opts := quietOptions()
+			opts.ChunkSize = tt.chunkSize
+			c := newTestCluster(t, opts)
+			body := io.MultiReader(strings.NewReader("hello world"))
+			if _, err := c.Upload(context.Background(), ar, body, -1, "hello.txt", "text/plain"); err != nil {
+				t.Fatal(err)
+			}
+			if r := onlyRequest(t, vol, "/"+fid); r.chunked != tt.chunked || r.body != "hello world" {
+				t.Errorf("the upload is %+v, want hello world, chunked: %v", r, tt.chunked)
+			}
+		})
 	}
 }
 
@@ -288,8 +303,10 @@ func TestGet(t *testing.T) {
 	if body, err := io.ReadAll(res.Body); err != nil || string(body) != "hello world" {
 		t.Errorf("body %q, %v", body, err)
 	}
-	if r := onlyRequest(t, vol, "/"+fid); r.method != http.MethodGet || r.header.Get("Range") != "bytes=0-4" {
-		t.Errorf("the volume server got %s with Range %q", r.method, r.header.Get("Range"))
+	// A Range is preceded by a HEAD request, which tells whether the fid is a manifest
+	reqs := vol.requestsTo("/" + fid)
+	if len(reqs) != 2 || reqs[0].method != http.MethodHead || reqs[1].method != http.MethodGet || reqs[1].header.Get("Range") != "bytes=0-4" {
+		t.Errorf("the volume server got %+v", reqs)
 	}
 }
 
@@ -405,7 +422,8 @@ func TestGetNotFound(t *testing.T) {
 	}
 }
 
-// Get returns an *HTTPError for other error statuses, and doesn't try the other copies for them.
+// Get returns an *HTTPError for other error statuses, and doesn't try the other copies for them. (A
+// 416 also gets a HEAD request, which tells whether the fid is a manifest.)
 func TestGetErrorStatus(t *testing.T) {
 	vol1, vol2 := newFakeServer(t), newFakeServer(t)
 	for _, vol := range []*fakeServer{vol1, vol2} {
@@ -417,8 +435,14 @@ func TestGetErrorStatus(t *testing.T) {
 	if !errors.As(err, &he) || he.StatusCode != http.StatusRequestedRangeNotSatisfiable {
 		t.Errorf("Get returned %v, want HTTP 416", err)
 	}
-	if n := len(vol1.requestsTo("/"+fid)) + len(vol2.requestsTo("/"+fid)); n != 1 {
-		t.Errorf("the volume servers got %d requests, want 1", n)
+	gets := 0
+	for _, r := range append(vol1.requestsTo("/"+fid), vol2.requestsTo("/"+fid)...) {
+		if r.method == http.MethodGet {
+			gets++
+		}
+	}
+	if gets != 1 {
+		t.Errorf("the volume servers got %d GET requests, want 1", gets)
 	}
 }
 

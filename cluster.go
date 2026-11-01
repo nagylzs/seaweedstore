@@ -19,6 +19,7 @@ const (
 	defaultStatusUpdateInterval = 5 * time.Second
 	defaultTimeout              = 5 * time.Second
 	defaultVolumeTimeout        = 10 * time.Second
+	defaultChunkSize            = 32 << 20
 	// After a failed status update, the next one comes after this long, if that is shorter than
 	// StatusUpdateInterval.
 	retryInterval = time.Second
@@ -75,6 +76,9 @@ func newCluster(opts Options, masters ...string) *Cluster {
 	}
 	if opts.VolumeTimeout <= 0 {
 		opts.VolumeTimeout = defaultVolumeTimeout
+	}
+	if opts.ChunkSize == 0 {
+		opts.ChunkSize = defaultChunkSize
 	}
 	c := &Cluster{
 		options:   opts,

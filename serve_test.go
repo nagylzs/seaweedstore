@@ -32,10 +32,13 @@ func withHeaders(changes map[string]string) map[string]string {
 }
 
 // serve calls ServeFile for a request with the given method and headers, on a cluster with one
-// volume server that answers a.
+// volume server that answers a. It returns the response, and the last request of the volume server.
 func serve(t *testing.T, method string, header http.Header, a answer) (*httptest.ResponseRecorder, request, error) {
 	t.Helper()
 	vol := newFakeServer(t)
+	if header.Get("Range") != "" {
+		vol.answerFirst("/"+fid, answer{status: http.StatusOK, header: fileHeaders}) // the HEAD before a range
+	}
 	vol.answerFirst("/"+fid, a)
 	c := volumeCluster(t, quietOptions(), vol.addr())
 	r := httptest.NewRequest(method, "/files/1", nil)
@@ -44,7 +47,11 @@ func serve(t *testing.T, method string, header http.Header, a answer) (*httptest
 	}
 	w := httptest.NewRecorder()
 	err := c.ServeFile(w, r, fid)
-	return w, onlyRequest(t, vol, "/"+fid), err
+	reqs := vol.requestsTo("/" + fid)
+	if len(reqs) == 0 {
+		t.Fatal("the volume server got no request")
+	}
+	return w, reqs[len(reqs)-1], err
 }
 
 // ServeFile answers with the volume server's status, body and the headers that describe the body,
