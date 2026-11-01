@@ -2,10 +2,6 @@
 
 Planned changes. Remove an item when it's done.
 
-## Before v0.1.0
-
-### 1. Tag v0.1.0
-
 ## Later
 
 * TLS and JWT (SeaweedFS's `security.toml`). Only plain HTTP is supported.
