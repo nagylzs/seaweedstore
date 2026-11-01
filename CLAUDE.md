@@ -1,0 +1,77 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A Go client library (module `github.com/nagylzs/seaweedstore`, single package `seaweedstore` at the repo root) for the HTTP API of SeaweedFS masters and volume servers: it finds the leader master, caches where each volume is, assigns file ids, and uploads and reads files. No dependencies. Planned changes are in `TODO.md`.
+
+## Commands
+
+```sh
+go build ./...                          # build
+go vet ./...                            # vet
+go test -race ./...                     # unit tests, no SeaweedFS needed
+
+go test -tags integration -v ./testenv  # integration tests; they start the docker test cluster if needed
+testenv/cluster.sh up                   # start the docker test cluster (no arguments: list all commands)
+testenv/cluster.sh down                 # remove the cluster and its data
+```
+
+## Tests
+
+The unit tests (`*_test.go` at the root) run against fake servers (`fake_test.go`). A `fakeServer` sends the answer set for a request URI or path and records every request. The fixtures in it were captured with curl from SeaweedFS 4.50 (`chrislusf/seaweedfs:4.50`), and `volStatus` builds a `/vol/status` answer in the same format from a `layout`. `closedPort` and `closedPort2` are addresses where nothing listens, `hangingServer` accepts connections but never answers, and counts them, and `slowServer` runs a handler that can wait. `newTestCluster` makes a cluster without background status updates (`newCluster`), so that a test calls `updateStatus` when it wants; `readyCluster` calls it once, and `startCluster` uses `NewCluster`. `bodyTracker` is a transport for `Options.HTTPClient` that counts requests and the response bodies left open.
+
+Each test describes the intended behavior in its doc comment. `cluster_test.go` tests `cluster.go` (status updates, masters, lookups), `files_test.go` tests `files.go` (assign, upload, get, stat, delete), and `serve_test.go` tests `serve.go` against a volume server that answers with the headers of SeaweedFS 4.50.
+
+CI (`.github/workflows/test.yml`) checks gofmt, runs vet (also with the `integration` tag) and the unit tests with `-race` on every push and pull request, with Go 1.25 (the version in `go.mod`) and the latest. The integration tests run nightly and when the workflow is started by hand.
+
+## Test environment (`testenv/`)
+
+`testenv/compose.yaml` runs SeaweedFS 4.50 with three masters, master1 `172.29.0.11:9333`, master2 `.12` and master3 `.13`, and four volume servers: dc1-vol1 `172.29.0.21:8080` and dc1-vol2 `.22` in data center `dc1`, dc2-vol1 `.31` and dc2-vol2 `.32` in `dc2`, all in `rack1`. The default replication is `100`, so every volume has one copy in each data center. The servers advertise their IP addresses, and on Linux the host reaches them directly, so the Go code under test runs on the host with no port mapping. A fresh `up` takes about 10 seconds.
+
+`cluster.sh` is the interface to the cluster; it needs curl and jq on the host. `up` starts what isn't running and waits until every master follows one leader and the leader lists all four volume servers. `show` prints each master's view and the volumes of each volume server according to the leader. `stop`/`kill`/`start` stop a server cleanly, crash it, or start it again. Volume servers run with `-preStopSeconds=2`, so a stop takes about 2 seconds.
+
+`testenv/integration_test.go` drives the cluster through `cluster.sh`. Each test starts with `cluster.sh up`, and tests that stop a server run `up` in cleanup, which leaves the cluster healthy, possibly with a different leader. `newCluster` returns a `Cluster` after `WaitUntilReady`, which logs to `t.Output()`; `Close` in cleanup waits until the status updates have stopped, so nothing logs after the test. `TestLeaderStops` takes about 70 seconds, the others up to about 20. The tests use the default collection only: every new collection creates volumes, and each volume server has room for 20. A leader change sometimes makes SeaweedFS create six more volumes too, so if assigns fail with 406 after many runs, start over with `down` and `up`.
+
+## Architecture
+
+**Status updates (`cluster.go`).** `NewCluster` checks the master addresses, and `newCluster` fills in the zero `Options` (5 seconds for `StatusUpdateInterval` and `Timeout`, 10 for `VolumeTimeout`, a client on `http.DefaultTransport` for a nil `HTTPClient`; a nil `Logger` means `slog.Default()`, looked up at each log). `NewCluster` then starts `run`, which updates the status every `StatusUpdateInterval`, and `retryInterval` (1 second) after a failed update if that is shorter, until `Close`. `Close` cancels `c.ctx`, which also cancels an update in progress, and waits until `run` has closed `c.done`. After `Close`, every method returns `ErrClosed` (`closed`); requests in progress go on. `WaitUntilReady` waits until the first complete update closes `c.ready`, and on a timeout returns the error of the last update (`lastErr`).
+
+Each `updateStatus` asks every master for `/cluster/status` in parallel, takes the first one that says `IsLeader` as the leader, asks only the leader for `/vol/status`, and indexes it into `volumes` (volume id → locations). It fails without a leader, with what each master answered, and sets `leaderIdx` to -1. It also fails when the leader can't send the volume status, but keeps the leader. Either way it keeps `volumes` from the last successful update, so files can still be read during an election, and `statusTime` is when that update finished. An update whose context ends changes nothing, because its failures are not answers from the masters.
+
+The cluster's state is unexported. `masters`, `options` and `client` never change after `newCluster`; the rest is guarded by `mu`. Callers read it through `Masters`, `Leader` and `StatusTime`, and the locations of a volume through `LookupVolume`. SeaweedFS's JSON answers decode into the unexported types in `seaweedfs.go`, which have only the fields the library uses; the public types (`types.go`) have Go names, like `Addr` for SeaweedFS's `url`.
+
+**Unreachable servers.** `failedAt` maps the address of a master or volume server to when a request couldn't reach it (a transport error, not an HTTP status; see `reached`). `failedLast` moves such servers to the end of a list for `failedServerPenalty` (30 seconds), and a request that reaches the server removes it. Each status update records which masters answered.
+
+**Requests to masters (`cluster.go`, `master.go`).** `askMasters` sends a request to the leader, then, when it can't reach it or there is none, to the other masters (`masterOrder`), which forward assign and lookup requests to the leader. `getJSON` limits the whole request, including the answer, with `Options.Timeout`. `LookupVolume` answers from a copy of the `volumes` entry and falls back to `askMasters` for `/dir/lookup`, whose result is not cached; a 404 there becomes `ErrNotFound`. `Assign` (`files.go`) asks for `/dir/assign` (the query from `AssignOptions.query`, which leaves out zero fields), and after an HTTP 503 asks again after the answer's `Retry-After` (1 second without one), until its context is done. It doesn't retry a 406, which can mean that there is no room.
+
+**Requests to volume servers (`files.go`).** `ParseFid` accepts only a volume id, a comma, hex digits and an optional `_n`, so a fid can't change the meaning of a URL; every request for a file checks the fid with it. `fileRequest`, which `Get`, `Stat` and `Delete` use, tries the locations of the file's volume in random order, those in `Options.DataCenter` first, but the unreachable ones last (`tryOrder`). It goes on to the next copy on a transport error, a 404 or a 5xx status, unless its context is done, and returns the first other response. When every copy answered 404, it returns `ErrNotFound`. `Get` turns other error statuses into an `*HTTPError`. `Stat` sends a HEAD request with `Accept-Encoding: identity`, because with gzip SeaweedFS would send the compressed size and net/http would drop it. `Upload` PUTs the body to the volume server of an `AssignResult`, escapes `\` and `"` in the file name, and fails when the reported size is not `size` (unless that is negative, meaning unknown).
+
+**ServeFile (`serve.go`).** It forwards `forwardedHeaders` to `fileRequest`, with `Accept-Encoding: identity` for a range or when the client sent none, copies `bodyHeaders` from the answer (removing the caller's), copies `keptHeaders` only where the caller set none, adds `Vary`, and copies the status and the body. An error from `fileRequest` returns before anything is written, so the caller can still answer. `TestServeFile` in `testenv` checks the gzip and range behavior against SeaweedFS.
+
+**HTTP (`comm.go`).** Every request goes through `send`, with the cluster's client. Its timeout limits only the wait for the response headers: a `deadline` cancels the request's context when the timeout has passed after `start`. That is at once for a request without a body, and when the body has been read to the end (`startOnEOF`, also for a body from `GetBody`) otherwise. Requests to volume servers use `VolumeTimeout`, except uploads, which have none; requests to masters have none either, because `getJSON` limits them with a context. Reading the response body is limited only by the caller's context; `cancelOnClose` releases the request's context when the body is closed. A timeout gives an error that wraps `os.ErrDeadlineExceeded`. An unexpected status becomes an `*HTTPError` with the `error` field and the `Retry-After` of the answer (`newHTTPError`).
+
+## README
+
+`README.md` is the user-facing documentation. Update it when you change the public API or the behavior it describes, and check that its example still compiles.
+
+## SeaweedFS behavior
+
+Facts the code depends on, checked against SeaweedFS 4.50:
+
+- `/cluster/status`: a follower leaves out `IsLeader`. `Leader` and `Peers` are `ip:port.grpcport`.
+- Followers answer `/dir/lookup`, `/vol/status` and `/dir/assign` too; they forward assign requests to the leader. While the stopped leader is not replaced yet, a follower doesn't answer `/dir/assign` at all (it forwards to the stopped leader); after the election, it passes on the new leader's answers.
+- With three masters and the default `-electionTimeout` (10s), a new leader was elected 10 to 16 seconds after the leader stopped.
+- The new leader assigned the first fid 30 to 50 seconds after the election. It first answers 503 `master is warming up, topology is still loading`, then 406 `No writable volumes and no free volumes left` until the volume servers have found it, then briefly 503 `volume growth in progress`. A follower that hasn't noticed the election yet sends a volume server to the stopped leader, and connecting to a stopped container's address times out (after about 20 seconds for the volume server's gRPC dial, 3 seconds for a plain HTTP connect).
+- The master forgets a volume server within a second after it stops.
+- `/dir/lookup` returns the volume id as the string `volumeOrFileId`, and HTTP 404 with an `error` field for an unknown volume.
+- `/dir/assign` returns HTTP 503 with `Retry-After: 1` while volumes are being created (on a fresh cluster), and 406 with an `error` field when it can't create one.
+- An upload is answered with HTTP 201. A PUT keeps the name from `Content-Disposition`. SeaweedFS reads backslash escapes and raw UTF-8 in the quoted `filename`, but ignores the RFC 2231 `filename*`. Of a name with a path, it keeps only the part after the last `/` or `\`. Chunked uploads work.
+- `size` in the upload answer is the size of the file, also when SeaweedFS compresses it, and when the upload was sent with `Content-Encoding: gzip` (then it is the size after decompression).
+- A PUT with `Content-Type: application/x-www-form-urlencoded` stores an empty file and still answers 201: the volume server parses the body as a form. `size` is left out of the answer when it is 0.
+- `ReplicaPlacement` in `/vol/status` has the copy counts `dc`, `rack` and `node` (same rack), and leaves out the ones that are 0: `{}` for replication 000, `{"dc":1}` for 100, `{"node":1}` for 001.
+
+## Plans
+
+`TODO.md` has the planned changes and the known issues. Remove an item when it's done.

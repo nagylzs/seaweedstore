@@ -1,0 +1,39 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: # runs the integration tests too
+  schedule:
+    - cron: "23 3 * * *" # the integration tests, nightly
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.25", "stable"] # the version in go.mod, and the latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./... && go vet -tags integration ./...
+      - run: go test -race ./...
+
+  # The SeaweedFS cluster in docker (testenv/). The host reaches the containers by their addresses, which
+  # works on Linux runners.
+  integration:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - run: go test -tags integration -v ./testenv
+      - if: failure()
+        run: |
+          testenv/cluster.sh show || true
+          docker compose -f testenv/compose.yaml logs --tail 100

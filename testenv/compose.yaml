@@ -1,0 +1,120 @@
+# SeaweedFS cluster for testing seaweedstore: three masters and four volume servers in two data
+# centers. Use cluster.sh rather than docker compose directly.
+#
+# The servers advertise their IP addresses, and on Linux the host can reach those addresses
+# directly, so the Go code under test can run on the host without any port mapping. New volumes get
+# replication 100: one copy in each data center.
+name: seaweedstore-test
+
+x-server: &server
+  image: chrislusf/seaweedfs:4.50
+  init: true
+  stop_grace_period: 20s
+
+services:
+  master1:
+    <<: *server
+    hostname: master1
+    command:
+      - master
+      - -ip=172.29.0.11
+      - -peers=172.29.0.11:9333,172.29.0.12:9333,172.29.0.13:9333
+      - -defaultReplication=100
+      - -volumeSizeLimitMB=64
+    networks:
+      seaweed:
+        ipv4_address: 172.29.0.11
+
+  master2:
+    <<: *server
+    hostname: master2
+    command:
+      - master
+      - -ip=172.29.0.12
+      - -peers=172.29.0.11:9333,172.29.0.12:9333,172.29.0.13:9333
+      - -defaultReplication=100
+      - -volumeSizeLimitMB=64
+    networks:
+      seaweed:
+        ipv4_address: 172.29.0.12
+
+  master3:
+    <<: *server
+    hostname: master3
+    command:
+      - master
+      - -ip=172.29.0.13
+      - -peers=172.29.0.11:9333,172.29.0.12:9333,172.29.0.13:9333
+      - -defaultReplication=100
+      - -volumeSizeLimitMB=64
+    networks:
+      seaweed:
+        ipv4_address: 172.29.0.13
+
+  # Volume servers stop sending heartbeats -preStopSeconds before they stop, so that the master
+  # forgets them first. The default 10 seconds would make every stop slow.
+  dc1-vol1:
+    <<: *server
+    hostname: dc1-vol1
+    command:
+      - volume
+      - -ip=172.29.0.21
+      - -master=172.29.0.11:9333,172.29.0.12:9333,172.29.0.13:9333
+      - -dataCenter=dc1
+      - -rack=rack1
+      - -max=20
+      - -preStopSeconds=2
+    networks:
+      seaweed:
+        ipv4_address: 172.29.0.21
+
+  dc1-vol2:
+    <<: *server
+    hostname: dc1-vol2
+    command:
+      - volume
+      - -ip=172.29.0.22
+      - -master=172.29.0.11:9333,172.29.0.12:9333,172.29.0.13:9333
+      - -dataCenter=dc1
+      - -rack=rack1
+      - -max=20
+      - -preStopSeconds=2
+    networks:
+      seaweed:
+        ipv4_address: 172.29.0.22
+
+  dc2-vol1:
+    <<: *server
+    hostname: dc2-vol1
+    command:
+      - volume
+      - -ip=172.29.0.31
+      - -master=172.29.0.11:9333,172.29.0.12:9333,172.29.0.13:9333
+      - -dataCenter=dc2
+      - -rack=rack1
+      - -max=20
+      - -preStopSeconds=2
+    networks:
+      seaweed:
+        ipv4_address: 172.29.0.31
+
+  dc2-vol2:
+    <<: *server
+    hostname: dc2-vol2
+    command:
+      - volume
+      - -ip=172.29.0.32
+      - -master=172.29.0.11:9333,172.29.0.12:9333,172.29.0.13:9333
+      - -dataCenter=dc2
+      - -rack=rack1
+      - -max=20
+      - -preStopSeconds=2
+    networks:
+      seaweed:
+        ipv4_address: 172.29.0.32
+
+networks:
+  seaweed:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
