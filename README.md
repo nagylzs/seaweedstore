@@ -237,10 +237,10 @@ SeaweedFS accepts it. `ParseFid(fid)` checks a fid and returns its volume id.
 These were measured in the test cluster (see Testing) with SeaweedFS 4.50, three masters with the default
 `-electionTimeout`, and replication `100`.
 
-* **The leader master stops.** The other masters elect a new leader in 10 to 16 seconds. Files can be read all the
+* **The leader master stops.** The other masters elect a new leader in 10 to 18 seconds. Files can be read all the
   time. `Assign` fails until the election, because the other masters wait for the stopped leader. The new leader
   first answers 503 (which `Assign` retries), then 406 until the volume servers have found it, and assigned the
-  first fid 30 to 50 seconds after the election.
+  first fid 16 to 50 seconds after the election (16 on the CI runner, 30 to 50 on a laptop).
 * **A volume server stops.** Its files are read from their other copies. The first read that tries the stopped
   server waits up to `VolumeTimeout`; the reads in the next 30 seconds try it last. The master forgets the server
   within a second, and the next status update drops it.
