@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -75,11 +76,12 @@ func (c *Cluster) Upload(ctx context.Context, a *AssignResult, body io.Reader, s
 	if chunkSize := c.options.ChunkSize; chunkSize > 0 && (size < 0 || size > chunkSize) {
 		return c.uploadChunked(ctx, a, body, size, name, contentType)
 	}
-	return c.uploadFile(ctx, a, body, size, name, contentType, "")
+	return c.uploadFile(ctx, a, body, size, name, contentType, false)
 }
 
-// uploadFile uploads a body as it is to the fid of a, with query in the URL.
-func (c *Cluster) uploadFile(ctx context.Context, a *AssignResult, body io.Reader, size int64, name, contentType, query string) (*UploadResult, error) {
+// uploadFile uploads a body as it is to the fid of a, as a chunk manifest if manifest is true, and with
+// the TTL that a was assigned with.
+func (c *Cluster) uploadFile(ctx context.Context, a *AssignResult, body io.Reader, size int64, name, contentType string, manifest bool) (*UploadResult, error) {
 	header := http.Header{}
 	if name != "" {
 		header.Set("Content-Disposition", `attachment; filename="`+quoteEscaper.Replace(name)+`"`)
@@ -87,11 +89,18 @@ func (c *Cluster) uploadFile(ctx context.Context, a *AssignResult, body io.Reade
 	if contentType != "" {
 		header.Set("Content-Type", contentType)
 	}
-	url := "http://" + a.Addr + "/" + a.Fid
-	if query != "" {
-		url += "?" + query
+	query := url.Values{}
+	if manifest {
+		query.Set("cm", "true")
 	}
-	res, err := c.send(ctx, http.MethodPut, url, header, body, size, 0)
+	if a.opts.TTL != "" {
+		query.Set("ttl", a.opts.TTL)
+	}
+	u := "http://" + a.Addr + "/" + a.Fid
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+	res, err := c.send(ctx, http.MethodPut, u, header, body, size, 0)
 	if err != nil {
 		return nil, err
 	}

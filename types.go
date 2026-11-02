@@ -52,7 +52,8 @@ type AssignOptions struct {
 	// data center. The default is the master's -defaultReplication.
 	Replication string
 	// TTL is how long the file is kept, e.g. "3m" for 3 minutes. Units: m minute, h hour, d day,
-	// w week, M month, y year. The default is forever.
+	// w week, M month, y year. The default is forever. Upload sends it with the file too, also with
+	// each chunk and the manifest of a large file. After it, reads give ErrNotFound.
 	TTL string
 	// DataCenter, Rack and DataNode (a volume server, host:port) prefer a place for the file.
 	DataCenter string
@@ -108,6 +109,9 @@ type UploadResult struct {
 	Size        int64  // the size of the file, also when SeaweedFS stores it compressed
 	ETag        string // without quotes
 	ContentType string // empty if the upload had none
+	// Chunks are the fids of the chunks of a file uploaded in chunks, in their order, and nil for
+	// other files. Delete deletes them with the file.
+	Chunks []string
 }
 
 // FileInfo describes a stored file.

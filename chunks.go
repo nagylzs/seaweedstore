@@ -75,7 +75,7 @@ func (c *Cluster) uploadChunked(ctx context.Context, a *AssignResult, body io.Re
 		first := make([]byte, chunkSize+1)
 		n, err := io.ReadFull(body, first)
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return c.uploadFile(ctx, a, bytes.NewReader(first[:n]), int64(n), name, contentType, "")
+			return c.uploadFile(ctx, a, bytes.NewReader(first[:n]), int64(n), name, contentType, false)
 		}
 		if err != nil {
 			return nil, err
@@ -111,7 +111,7 @@ func (c *Cluster) uploadChunked(ctx context.Context, a *AssignResult, body io.Re
 		if size < 0 {
 			sent = -1 // it may be shorter
 		}
-		ur, err := c.uploadFile(ctx, ca, chunk, sent, "", "application/octet-stream", "")
+		ur, err := c.uploadFile(ctx, ca, chunk, sent, "", "application/octet-stream", false)
 		if err == nil && ur.Size != chunk.n {
 			err = fmt.Errorf("the volume server stored %d bytes of %d", ur.Size, chunk.n)
 		}
@@ -137,11 +137,14 @@ func (c *Cluster) uploadChunked(ctx context.Context, a *AssignResult, body io.Re
 	if err != nil {
 		return fail(err)
 	}
-	ur, err := c.uploadFile(ctx, a, bytes.NewReader(data), int64(len(data)), "", manifestType, "cm=true")
+	ur, err := c.uploadFile(ctx, a, bytes.NewReader(data), int64(len(data)), "", manifestType, true)
 	if err != nil {
 		return fail(fmt.Errorf("the manifest: %w", err))
 	}
 	result := &UploadResult{Name: m.Name, Size: m.Size, ETag: ur.ETag, ContentType: contentType}
+	for _, ch := range m.Chunks {
+		result.Chunks = append(result.Chunks, ch.Fid)
+	}
 	if result.Name == "" {
 		result.Name = a.Fid // as SeaweedFS names a file without a name
 	}

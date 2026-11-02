@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -65,7 +66,11 @@ func TestUploadInChunks(t *testing.T) {
 			t.Fatalf("size %d: %v", size, err)
 		}
 		m := manifestOf(t, vol.store, ar.Fid)
-		if want := (UploadResult{Name: "hello.txt", Size: 11, ETag: vol.store.file(ar.Fid).etag(), ContentType: "text/plain"}); *ur != want {
+		want := UploadResult{Name: "hello.txt", Size: 11, ETag: vol.store.file(ar.Fid).etag(), ContentType: "text/plain"}
+		for _, ch := range m.Chunks {
+			want.Chunks = append(want.Chunks, ch.Fid)
+		}
+		if !reflect.DeepEqual(*ur, want) {
 			t.Errorf("size %d: Upload = %+v, want %+v", size, *ur, want)
 		}
 		if m.Name != "hello.txt" || m.Mime != "text/plain" || m.Size != 11 || len(m.Chunks) != 3 {
@@ -85,6 +90,45 @@ func TestUploadInChunks(t *testing.T) {
 		for _, r := range assigns[1:] {
 			if r.query != "collection=docs" {
 				t.Errorf("size %d: a chunk was assigned with %q", size, r.query)
+			}
+		}
+	}
+}
+
+// The TTL of AssignOptions goes with the upload of a file, of each chunk and of the manifest, and with
+// the assigns of the chunks. Without one, the uploads have no ttl.
+func TestUploadSendsTTL(t *testing.T) {
+	for _, tt := range []struct {
+		ttl, small, chunk, manifest string
+	}{
+		{"3m", "ttl=3m", "ttl=3m", "cm=true&ttl=3m"},
+		{"", "", "", "cm=true"},
+	} {
+		vol := newMemVolume(t, newMemStore())
+		c, leader := memCluster(t, chunkOptions(), vol.addr())
+		small, _ := c.Assign(context.Background(), AssignOptions{TTL: tt.ttl})
+		if _, err := c.Upload(context.Background(), small, strings.NewReader("hell"), 4, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		large, _ := c.Assign(context.Background(), AssignOptions{TTL: tt.ttl})
+		ur, err := c.Upload(context.Background(), large, strings.NewReader("hello world"), 11, "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r := onlyRequest(t, vol.fakeServer, "/"+small.Fid); r.query != tt.small {
+			t.Errorf("TTL %q: the upload has the query %q, want %q", tt.ttl, r.query, tt.small)
+		}
+		if r := onlyRequest(t, vol.fakeServer, "/"+large.Fid); r.query != tt.manifest {
+			t.Errorf("TTL %q: the manifest has the query %q, want %q", tt.ttl, r.query, tt.manifest)
+		}
+		for _, chunk := range ur.Chunks {
+			if r := onlyRequest(t, vol.fakeServer, "/"+chunk); r.query != tt.chunk {
+				t.Errorf("TTL %q: chunk %s has the query %q, want %q", tt.ttl, chunk, r.query, tt.chunk)
+			}
+		}
+		for _, r := range leader.requestsTo("/dir/assign")[2:] {
+			if want := strings.TrimSuffix("ttl="+tt.ttl, "ttl="); r.query != want {
+				t.Errorf("TTL %q: a chunk was assigned with %q, want %q", tt.ttl, r.query, want)
 			}
 		}
 	}

@@ -168,18 +168,26 @@ mux.HandleFunc("GET /files/{id}", func(w http.ResponseWriter, r *http.Request) {
 means that the size is not known. The volume server reports how many bytes it stored, and `Upload` fails if that
 is not `size`.
 
+With `AssignOptions.TTL`, for example `"7d"`, the fid is on a volume for files with that TTL, and `Upload` sends
+the TTL with the file too. After it, `Get`, `Stat` and `ServeFile` give `ErrNotFound`. (SeaweedFS 4.50 gives a
+file on such a volume the volume's TTL anyway.) The TTL counts from the upload, so a file in chunks expires chunk
+by chunk: for about as long as its upload took, the manifest is still there, but reading its first chunks fails.
+
 #### Large files
 
 A file larger than `Options.ChunkSize` (32 MB by default) is uploaded in chunks. Each chunk goes to a fid of its
 own, which `Upload` assigns with the `AssignOptions` of the file's fid, and then a SeaweedFS chunk manifest, which
-lists the chunks, goes to the file's fid. You keep only that fid:
+lists the chunks, goes to the file's fid. You keep only that fid; `UploadResult.Chunks` has the fids of the chunks,
+for example to tell them from orphans when you compare the fids in your database with those on the volume
+servers:
 
 * `Get`, `Stat`, `ServeFile` and `Delete` handle it like any file. The library reads the chunks itself, each from
   a copy in `Options.DataCenter` first, and from another copy when one can't be reached, so only the chunks that a
   range needs are read.
-* Other SeaweedFS clients read the fid like any file: the volume server joins the chunks for them. But it picks a
-  copy of each chunk at random, and doesn't try another: after a volume server was killed, half of such reads
-  failed for at least 45 seconds once, because the joining server still had the killed one.
+* Other SeaweedFS clients read the fid like any file: the volume server joins the chunks for them. Up to
+  SeaweedFS 4.51, it picks a copy of each chunk at random, and doesn't try another: after a volume server with a
+  copy was killed, most such reads failed for up to 10 minutes
+  ([seaweedfs#12308](https://github.com/seaweedfs/seaweedfs/issues/12308), fixed on master after 4.51).
 * Deleting the file deletes its chunks too.
 * With an unknown size, `Upload` holds up to a chunk in memory, to find out whether the file needs chunks.
   Otherwise it streams the body.

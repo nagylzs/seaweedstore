@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -128,7 +129,7 @@ func TestUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (UploadResult{Name: "hello.txt", Size: 11, ETag: "c99465aa", ContentType: "text/plain"}); *ur != want {
+	if want := (UploadResult{Name: "hello.txt", Size: 11, ETag: "c99465aa", ContentType: "text/plain"}); !reflect.DeepEqual(*ur, want) {
 		t.Errorf("Upload = %+v, want %+v", *ur, want)
 	}
 	r := onlyRequest(t, vol, "/"+fid)

@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -262,8 +263,8 @@ func TestLargeFile(t *testing.T) {
 			t.Errorf("size %d: Upload = %+v", size, *ur)
 		}
 		chunks := chunksOf(t, c, ar.Fid)
-		if len(chunks) != 4 {
-			t.Errorf("size %d: %d chunks, want 4", size, len(chunks))
+		if len(chunks) != 4 || !slices.Equal(ur.Chunks, chunks) {
+			t.Errorf("size %d: the manifest has the chunks %v, Upload says %v, want 4", size, chunks, ur.Chunks)
 		}
 
 		if body := readBody(t, get(t, c, ar.Fid, nil)); body != string(data) {
@@ -296,6 +297,60 @@ func TestLargeFile(t *testing.T) {
 				t.Errorf("size %d: Get of chunk %s after Delete returned %v", size, chunk, err)
 			}
 		}
+	}
+}
+
+// A file with a TTL, also one in chunks, can be read until the TTL has passed, and then not: Get and
+// Stat give ErrNotFound, also for each chunk. A file without a TTL stays.
+func TestTTL(t *testing.T) {
+	cluster(t, "up")
+	c := newClusterOpts(t, seaweedstore.Options{StatusUpdateInterval: time.Second, ChunkSize: 1 << 20})
+	ctx := context.Background()
+	ttl := seaweedstore.AssignOptions{TTL: "1m"}
+	small := put(t, c, assignWith(t, c, ttl, 30*time.Second), "small.txt", "hello")
+	data := randomData(2500000)
+	ar := assignWith(t, c, ttl, 30*time.Second)
+	ur, err := c.Upload(ctx, ar, bytes.NewReader(data), int64(len(data)), "large.bin", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploaded := time.Now()
+	kept := upload(t, c, "kept.txt", "kept")
+	files := append([]string{small, ar.Fid}, ur.Chunks...)
+	for _, fid := range files {
+		if _, err := c.Stat(ctx, fid); err != nil {
+			t.Fatalf("Stat(%s) right after the upload: %v", fid, err)
+		}
+	}
+	if body := readBody(t, get(t, c, ar.Fid, nil)); body != string(data) {
+		t.Fatalf("Get of the file in chunks gave %d bytes, not the uploaded ones", len(body))
+	}
+	waitFor(t, 2*time.Minute, "expiry", func() error {
+		_, err := c.Stat(ctx, ar.Fid)
+		if err == nil {
+			return errors.New("the file in chunks is still there")
+		}
+		if !errors.Is(err, seaweedstore.ErrNotFound) {
+			t.Fatalf("Stat of the file in chunks: %v", err)
+		}
+		return nil
+	})
+	if expired := time.Since(uploaded); expired < 50*time.Second {
+		t.Errorf("the file in chunks expired %v after the upload, with a TTL of a minute", expired)
+	} else {
+		t.Logf("the file in chunks expired %v after the upload", expired.Round(time.Second))
+	}
+	// The chunks and the small file were uploaded before the manifest, so they have expired too
+	for _, fid := range files {
+		if _, err := c.Get(ctx, fid, nil); !errors.Is(err, seaweedstore.ErrNotFound) {
+			t.Errorf("Get(%s) after the TTL returned %v", fid, err)
+		}
+		if _, err := c.Stat(ctx, fid); !errors.Is(err, seaweedstore.ErrNotFound) {
+			t.Errorf("Stat(%s) after the TTL returned %v", fid, err)
+		}
+	}
+	if body := readBody(t, get(t, c, kept, nil)); body != "kept" {
+		t.Errorf("the file without a TTL gave %q", body)
 	}
 }
 
@@ -543,10 +598,16 @@ func upload(t *testing.T, c *seaweedstore.Cluster, name, data string) string {
 // of SeaweedFS, but not the 406 answers of a new leader (see TestLeaderStops).
 func assign(t *testing.T, c *seaweedstore.Cluster, timeout time.Duration) *seaweedstore.AssignResult {
 	t.Helper()
+	return assignWith(t, c, seaweedstore.AssignOptions{}, timeout)
+}
+
+// assignWith is assign with options.
+func assignWith(t *testing.T, c *seaweedstore.Cluster, opts seaweedstore.AssignOptions, timeout time.Duration) *seaweedstore.AssignResult {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	for {
-		ar, err := c.Assign(ctx, seaweedstore.AssignOptions{})
+		ar, err := c.Assign(ctx, opts)
 		if err == nil {
 			return ar
 		}
