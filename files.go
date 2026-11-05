@@ -80,7 +80,7 @@ func (c *Cluster) Upload(ctx context.Context, a *AssignResult, body io.Reader, s
 }
 
 // uploadFile uploads a body as it is to the fid of a, as a chunk manifest if manifest is true, and with
-// the TTL that a was assigned with.
+// the TTL and the Fsync that a was assigned with.
 func (c *Cluster) uploadFile(ctx context.Context, a *AssignResult, body io.Reader, size int64, name, contentType string, manifest bool) (*UploadResult, error) {
 	header := http.Header{}
 	if name != "" {
@@ -95,6 +95,9 @@ func (c *Cluster) uploadFile(ctx context.Context, a *AssignResult, body io.Reade
 	}
 	if a.opts.TTL != "" {
 		query.Set("ttl", a.opts.TTL)
+	}
+	if a.opts.Fsync {
+		query.Set("fsync", "true")
 	}
 	u := "http://" + a.Addr + "/" + a.Fid
 	if len(query) > 0 {

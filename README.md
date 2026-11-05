@@ -179,6 +179,12 @@ the TTL with the file too. After it, `Get`, `Stat` and `ServeFile` give `ErrNotF
 file on such a volume the volume's TTL anyway.) The TTL counts from the upload, so a file in chunks expires chunk
 by chunk: for about as long as its upload took, the manifest is still there, but reading its first chunks fails.
 
+With `AssignOptions.Fsync`, `Upload` returns when the volume servers have the file on their disks, with the index of
+its volume. Otherwise they answer when the operating system has it, so a power failure can lose a file that was
+uploaded, even if your database, which waits for its disk, already refers to it. It costs about one fsync of the disk
+for an upload, but the writes to a volume that wait at the same time share one: on an NVMe SSD, 3.4 ms instead of 0.2 ms
+for a small file, and of 20000 small uploads a second with 64 clients, 9900 were left.
+
 #### Large files
 
 A file larger than `Options.ChunkSize` (32 MB by default) is uploaded in chunks. Each chunk goes to a fid of its

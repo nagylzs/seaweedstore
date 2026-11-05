@@ -354,6 +354,27 @@ func TestTTL(t *testing.T) {
 	}
 }
 
+// A volume server takes Fsync, for a file, for its chunks and manifest, and with copies in another data center.
+func TestFsync(t *testing.T) {
+	cluster(t, "up")
+	c := newClusterOpts(t, seaweedstore.Options{StatusUpdateInterval: time.Second, ChunkSize: 1 << 20})
+	ctx := context.Background()
+	for _, opts := range []seaweedstore.AssignOptions{{Fsync: true}, {Fsync: true, Replication: "100"}} {
+		small := put(t, c, assignWith(t, c, opts, 30*time.Second), "small.txt", "hello")
+		if body := readBody(t, get(t, c, small, nil)); body != "hello" {
+			t.Errorf("%+v: the small file gave %q", opts, body)
+		}
+		data := randomData(2500000)
+		ar := assignWith(t, c, opts, 30*time.Second)
+		if _, err := c.Upload(ctx, ar, bytes.NewReader(data), int64(len(data)), "large.bin", ""); err != nil {
+			t.Fatal(err)
+		}
+		if body := readBody(t, get(t, c, ar.Fid, nil)); body != string(data) {
+			t.Errorf("%+v: the file in chunks gave %d bytes, not the uploaded ones", opts, len(body))
+		}
+	}
+}
+
 // When a volume server with copies of chunks is killed, the file is read from the other copies. The
 // cluster here updates its status only every minute, so it still lists the killed server, as it
 // would right after a crash. Only the first read waits for it.

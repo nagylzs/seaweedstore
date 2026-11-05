@@ -134,6 +134,47 @@ func TestUploadSendsTTL(t *testing.T) {
 	}
 }
 
+// Fsync of AssignOptions goes with the upload of a file, of each chunk and of the manifest, but not to the
+// master, which doesn't know it. Without it, the uploads have no fsync.
+func TestUploadSendsFsync(t *testing.T) {
+	for _, tt := range []struct {
+		opts                           AssignOptions
+		small, chunk, manifest, assign string
+	}{
+		{AssignOptions{Fsync: true}, "fsync=true", "fsync=true", "cm=true&fsync=true", ""},
+		{AssignOptions{Fsync: true, TTL: "3m"}, "fsync=true&ttl=3m", "fsync=true&ttl=3m", "cm=true&fsync=true&ttl=3m", "ttl=3m"},
+		{AssignOptions{}, "", "", "cm=true", ""},
+	} {
+		vol := newMemVolume(t, newMemStore())
+		c, leader := memCluster(t, chunkOptions(), vol.addr())
+		small, _ := c.Assign(context.Background(), tt.opts)
+		if _, err := c.Upload(context.Background(), small, strings.NewReader("hell"), 4, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		large, _ := c.Assign(context.Background(), tt.opts)
+		ur, err := c.Upload(context.Background(), large, strings.NewReader("hello world"), 11, "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r := onlyRequest(t, vol.fakeServer, "/"+small.Fid); r.query != tt.small {
+			t.Errorf("%+v: the upload has the query %q, want %q", tt.opts, r.query, tt.small)
+		}
+		if r := onlyRequest(t, vol.fakeServer, "/"+large.Fid); r.query != tt.manifest {
+			t.Errorf("%+v: the manifest has the query %q, want %q", tt.opts, r.query, tt.manifest)
+		}
+		for _, chunk := range ur.Chunks {
+			if r := onlyRequest(t, vol.fakeServer, "/"+chunk); r.query != tt.chunk {
+				t.Errorf("%+v: chunk %s has the query %q, want %q", tt.opts, chunk, r.query, tt.chunk)
+			}
+		}
+		for _, r := range leader.requestsTo("/dir/assign") {
+			if r.query != tt.assign {
+				t.Errorf("%+v: an assign has the query %q, want %q", tt.opts, r.query, tt.assign)
+			}
+		}
+	}
+}
+
 // A file of a multiple of ChunkSize has no empty last chunk, also with an unknown size.
 func TestUploadInChunksExactSize(t *testing.T) {
 	for _, size := range []int64{8, -1} {

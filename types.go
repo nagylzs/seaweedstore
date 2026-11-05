@@ -73,6 +73,11 @@ type AssignOptions struct {
 	Preallocate int64
 	// MemoryMapMaxSizeMb makes new volumes memory mapped files of this size. Windows only.
 	MemoryMapMaxSizeMb int
+	// Fsync makes Upload wait until the volume servers have the file on their disks, so that it survives a power
+	// failure. Otherwise they answer when the operating system has it. It is not for the master: Upload sends it
+	// with the file, also with each chunk and the manifest of a large file. It costs an fsync for each batch of
+	// writes to a volume.
+	Fsync bool
 }
 
 // query returns the options as a URL query.
