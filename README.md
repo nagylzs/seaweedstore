@@ -102,10 +102,16 @@ func main() {
 | `VolumeTimeout`        | 10 s    | The limit for the wait for a volume server's response headers when reading or deleting a file. After it, the next copy is tried. |
 | `ChunkSize`            | 32 MB   | Files larger than this are uploaded in chunks of this size (see Uploads). It must not be larger than the volume servers' `-fileSizeLimitMB`. Negative means never. |
 | `DataCenter`           | ""      | The data center to read from first, for example the one closest to your program. Its copies are tried before the others. |
-| `HTTPClient`           | nil     | The `*http.Client` that sends all requests, for TLS settings, proxies or connection limits. nil means a client on `http.DefaultTransport`. Its `Timeout` must be zero. |
+| `HTTPClient`           | nil     | The `*http.Client` that sends all requests, for TLS settings, proxies or connection limits. nil means a client on a copy of `http.DefaultTransport` that closes connections unused for 25 seconds. Its `Timeout` must be zero, and it should close unused connections before the volume servers do (see below). |
 | `Logger`               | nil     | The `*slog.Logger` that failed status updates are logged to. nil means `slog.Default()`. |
 
 A zero duration or `ChunkSize` means the default.
+
+A volume server closes a connection that was unused for its `-idleTimeout`, 30 seconds by default. If it does that
+just when a request starts on the connection, net/http sends reads, deletes and small uploads from memory again,
+but an upload from a stream or of more than a few KB fails with an error like `broken pipe`. The default client
+avoids this by closing unused connections first. If you set `HTTPClient`, or give the volume servers an
+`-idleTimeout` of 25 seconds or less, set an `IdleConnTimeout` below it on your transport.
 
 ### Cluster
 

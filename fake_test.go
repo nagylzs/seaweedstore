@@ -96,11 +96,12 @@ type request struct {
 // request URI, or for the path when there is none for the URI, and 404 when there is neither.
 // Answers queued with answerFirst come before the one set with answer. It records every request.
 type fakeServer struct {
-	srv      *httptest.Server
-	mu       sync.Mutex
-	answers  map[string]answer
-	queued   map[string][]answer
-	requests []request
+	srv       *httptest.Server
+	mu        sync.Mutex
+	answers   map[string]answer
+	queued    map[string][]answer
+	requests  []request
+	closeNext bool
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -122,6 +123,16 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		contentLength: r.ContentLength,
 		chunked:       len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked",
 	})
+	if f.closeNext {
+		f.closeNext = false
+		f.mu.Unlock()
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			panic(err)
+		}
+		conn.Close()
+		return
+	}
 	a, ok := f.next(r.RequestURI)
 	if !ok {
 		a, ok = f.next(r.URL.Path)
@@ -153,6 +164,14 @@ func (f *fakeServer) answerFirst(uri string, answers ...answer) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queued[uri] = append(f.queued[uri], answers...)
+}
+
+// closeNextRequest makes the server close the connection of the next request without answering, like
+// a volume server whose -idleTimeout ends just when a request comes. It still records the request.
+func (f *fakeServer) closeNextRequest() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closeNext = true
 }
 
 // addr returns the server's address as host:port, the way SeaweedFS lists servers.

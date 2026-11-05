@@ -38,8 +38,12 @@ type Options struct {
 	// DataCenter is the data center to read from first. Reads and deletes try the copies in it before
 	// the others, for example to read from the closest copy. Empty means no preference.
 	DataCenter string
-	// HTTPClient sends all requests. Nil means a client on http.DefaultTransport. Its Timeout must be
-	// zero, because it would also limit reading and sending files.
+	// HTTPClient sends all requests. Nil means a client on a copy of http.DefaultTransport that closes
+	// connections unused for 25 seconds. Its Timeout must be zero, because it would also limit reading
+	// and sending files. It should close unused connections before the volume servers do, after their
+	// -idleTimeout (30 seconds by default). Otherwise an upload from a stream or of more than a few KB
+	// fails, rarely, if a volume server closes the connection just when it starts; net/http sends
+	// other requests again. Set this if your volume servers have an -idleTimeout of 25 seconds or less.
 	HTTPClient *http.Client
 }
 

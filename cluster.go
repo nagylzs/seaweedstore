@@ -20,6 +20,9 @@ const (
 	defaultTimeout              = 5 * time.Second
 	defaultVolumeTimeout        = 10 * time.Second
 	defaultChunkSize            = 32 << 20
+	// The default client closes a connection unused for this long, which must come before a volume
+	// server closes it: its -idleTimeout is 30 seconds by default.
+	defaultIdleConnTimeout = 25 * time.Second
 	// After a failed status update, the next one comes after this long, if that is shorter than
 	// StatusUpdateInterval.
 	retryInterval = time.Second
@@ -89,13 +92,26 @@ func newCluster(opts Options, masters ...string) *Cluster {
 		failedAt:  make(map[string]time.Time),
 	}
 	if c.client == nil {
-		c.client = &http.Client{}
+		c.client = defaultClient()
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	for _, m := range masters {
 		c.masters = append(c.masters, master{addr: m})
 	}
 	return c
+}
+
+// defaultClient returns the client for a nil Options.HTTPClient: one on a copy of http.DefaultTransport
+// with defaultIdleConnTimeout, or on http.DefaultTransport if a program has replaced it with something
+// else.
+func defaultClient() *http.Client {
+	t, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Client{}
+	}
+	t = t.Clone()
+	t.IdleConnTimeout = defaultIdleConnTimeout
+	return &http.Client{Transport: t}
 }
 
 // run updates the status until Close.
@@ -119,11 +135,15 @@ func (c *Cluster) run() {
 }
 
 // Close stops the status updates, cancelling one in progress, and waits until they have stopped.
-// Requests in progress go on, but new ones return ErrClosed.
+// Requests in progress go on, but new ones return ErrClosed. It closes the unused connections of the
+// default client, but not those of Options.HTTPClient.
 func (c *Cluster) Close() {
 	c.cancel()
 	if c.done != nil {
 		<-c.done
+	}
+	if c.options.HTTPClient == nil {
+		c.client.CloseIdleConnections()
 	}
 }
 

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -518,4 +521,68 @@ func TestHTTPClient(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Without Options.HTTPClient, the cluster has a client of its own on a copy of http.DefaultTransport,
+// which closes unused connections before a volume server with the default -idleTimeout of 30 seconds
+// does, and Close closes them. Close leaves a client from Options.HTTPClient alone.
+func TestDefaultClient(t *testing.T) {
+	server := func(t *testing.T) (addr string, opened, closed *atomic.Int32) {
+		opened, closed = &atomic.Int32{}, &atomic.Int32{}
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			switch state {
+			case http.StateNew:
+				opened.Add(1)
+			case http.StateClosed:
+				closed.Add(1)
+			}
+		}
+		srv.Start()
+		t.Cleanup(srv.Close)
+		return srv.Listener.Addr().String(), opened, closed
+	}
+
+	t.Run("default", func(t *testing.T) {
+		addr, _, closed := server(t)
+		c := volumeCluster(t, quietOptions(), addr)
+		transport, ok := c.client.Transport.(*http.Transport)
+		if !ok || transport == http.DefaultTransport {
+			t.Fatalf("the client has the transport %v", c.client.Transport)
+		}
+		if d := transport.IdleConnTimeout; d <= 0 || d >= 30*time.Second {
+			t.Errorf("IdleConnTimeout = %v, want it below 30 seconds", d)
+		}
+		if transport.Proxy == nil || transport.DialContext == nil {
+			t.Error("the transport is not a copy of http.DefaultTransport")
+		}
+		if err := c.Delete(context.Background(), fid); err != nil {
+			t.Fatal(err)
+		}
+		c.Close()
+		waitUntil(t, "Close closes the unused connection", func() bool { return closed.Load() == 1 })
+	})
+
+	t.Run("given", func(t *testing.T) {
+		addr, opened, _ := server(t)
+		client := &http.Client{Transport: &http.Transport{}}
+		defer client.CloseIdleConnections()
+		opts := quietOptions()
+		opts.HTTPClient = client
+		c := volumeCluster(t, opts, addr)
+		if err := c.Delete(context.Background(), fid); err != nil {
+			t.Fatal(err)
+		}
+		c.Close()
+		res, err := client.Get("http://" + addr + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if n := opened.Load(); n != 1 {
+			t.Errorf("the server saw %d connections: Close closed the unused one", n)
+		}
+	})
 }

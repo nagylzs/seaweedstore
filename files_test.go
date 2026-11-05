@@ -5,10 +5,12 @@ import (
 	"errors"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -581,5 +583,109 @@ func TestDelete(t *testing.T) {
 	vol.answer("/"+fid, http.StatusNotFound, `{"size":0}`)
 	if err := c.Delete(context.Background(), fid); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Delete of a missing file returned %v", err)
+	}
+}
+
+// A volume server closes a connection after its -idleTimeout, which can be just when a request comes
+// on it. Then a Delete and an upload from memory go again on a new connection, as for a read: the
+// caller doesn't see it, the volume server isn't marked as unreachable, and nothing extra is on the
+// wire. A stream can't be sent again, so that upload fails rather than store a part of the file.
+func TestRequestOnConnectionBeingClosed(t *testing.T) {
+	ctx := context.Background()
+	// Upload reads the whole answer, so its connection is reused by every Go version.
+	idleConnection := func(t *testing.T) (*fakeServer, *Cluster, *AssignResult) {
+		vol, ar := uploadServer(t)
+		c := volumeCluster(t, quietOptions(), vol.addr())
+		if _, err := c.Upload(ctx, ar, strings.NewReader("hello world"), 11, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		vol.closeNextRequest()
+		return vol, c, ar
+	}
+	check := func(t *testing.T, vol *fakeServer, want int) []request {
+		t.Helper()
+		reqs := vol.requestsTo("/" + fid)
+		if len(reqs) != want {
+			t.Fatalf("the volume server got %d requests, want %d", len(reqs), want)
+		}
+		for _, r := range reqs {
+			if _, sent := r.header["Idempotency-Key"]; sent {
+				t.Errorf("%s was sent with an Idempotency-Key", r.method)
+			}
+		}
+		return reqs
+	}
+
+	t.Run("Delete", func(t *testing.T) {
+		vol, c, _ := idleConnection(t)
+		vol.answer("/"+fid, http.StatusAccepted, `{"size":40}`)
+		if err := c.Delete(ctx, fid); err != nil {
+			t.Fatal(err)
+		}
+		reqs := check(t, vol, 3)
+		if reqs[1].method != http.MethodDelete || reqs[2].method != http.MethodDelete {
+			t.Errorf("the volume server got %s and %s", reqs[1].method, reqs[2].method)
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if _, failed := c.failedAt[vol.addr()]; failed {
+			t.Error("a volume server that answered is marked as unreachable")
+		}
+	})
+
+	t.Run("upload from memory", func(t *testing.T) {
+		vol, c, ar := idleConnection(t)
+		if _, err := c.Upload(ctx, ar, strings.NewReader("HELLO WORLD"), 11, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		if reqs := check(t, vol, 3); reqs[2].body != "HELLO WORLD" {
+			t.Errorf("the volume server got %q", reqs[2].body)
+		}
+	})
+
+	t.Run("upload from a stream", func(t *testing.T) {
+		vol, c, ar := idleConnection(t)
+		body := io.MultiReader(strings.NewReader("HELLO WORLD")) // no GetBody
+		if _, err := c.Upload(ctx, ar, body, 11, "", ""); err == nil {
+			t.Error("Upload succeeded")
+		}
+		check(t, vol, 2)
+	})
+}
+
+// countingConn counts the writes to a connection.
+type countingConn struct {
+	net.Conn
+	writes *atomic.Int32
+}
+
+func (c countingConn) Write(p []byte) (int, error) {
+	c.writes.Add(1)
+	return c.Conn.Write(p)
+}
+
+// net/http doesn't send an upload again when a write fails after an earlier one has succeeded, so a
+// small upload from memory must be a single write with the headers. It is not if the body is wrapped
+// in something that hides its type.
+func TestSmallUploadFromMemoryIsOneWrite(t *testing.T) {
+	var writes atomic.Int32
+	opts := quietOptions()
+	opts.HTTPClient = &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return countingConn{Conn: conn, writes: &writes}, nil
+		},
+	}}
+	vol, ar := uploadServer(t)
+	c := volumeCluster(t, opts, vol.addr())
+	writes.Store(0)
+	if _, err := c.Upload(context.Background(), ar, strings.NewReader("hello world"), 11, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if n := writes.Load(); n != 1 {
+		t.Errorf("the upload took %d writes, want 1", n)
 	}
 }

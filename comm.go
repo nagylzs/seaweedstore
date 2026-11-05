@@ -46,8 +46,8 @@ func newHTTPError(res *http.Response) *HTTPError {
 // send sends a request with the cluster's HTTP client. The caller must close the response body.
 //
 // A size of -1 means that the length of the body is not known, so net/http sends it in chunks. The
-// timeout limits the wait for the response headers, after the body has been sent; zero means no
-// limit. Sending the body and reading the response body are limited by ctx only.
+// timeout limits the wait for the response headers of a request without a body; zero means no limit.
+// Sending a body and reading the response body are limited by ctx only.
 func (c *Cluster) send(ctx context.Context, method, url string, header http.Header, body io.Reader, size int64, timeout time.Duration) (*http.Response, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
@@ -60,25 +60,20 @@ func (c *Cluster) send(ctx context.Context, method, url string, header http.Head
 			req.Header.Add(k, v)
 		}
 	}
+	if method == http.MethodPut || method == http.MethodDelete {
+		// Both can be repeated for a fid, and this entry tells net/http so, with no header on the wire.
+		// Then, like a read, it goes again on a new connection when a reused one fails, as when a volume
+		// server closes it after its -idleTimeout just then. net/http does that for an upload only if
+		// it was a single write: a body of a known in-memory type, not wrapped in anything, that fits in
+		// its buffer with the headers. Other uploads rely on the IdleConnTimeout of the client (see
+		// defaultClient).
+		req.Header["Idempotency-Key"] = nil
+	}
 	if body != nil && size >= 0 {
 		req.ContentLength = size
 	}
 	d := &deadline{timeout: timeout, cancel: cancel}
-	if req.Body == nil || req.Body == http.NoBody {
-		d.start()
-	} else {
-		req.Body = &startOnEOF{ReadCloser: req.Body, d: d}
-		if getBody := req.GetBody; getBody != nil {
-			// net/http sends the body again from GetBody when it retries on a new connection
-			req.GetBody = func() (io.ReadCloser, error) {
-				b, err := getBody()
-				if err != nil {
-					return nil, err
-				}
-				return &startOnEOF{ReadCloser: b, d: d}, nil
-			}
-		}
-	}
+	d.start()
 	res, err := c.client.Do(req)
 	if d.stop() {
 		if err == nil {
@@ -130,21 +125,6 @@ func (d *deadline) stop() bool {
 		d.timer.Stop()
 	}
 	return d.expired
-}
-
-// startOnEOF starts the deadline when the request body has been read, that is, sent. net/http reads
-// a body of known length once more to see that it has ended.
-type startOnEOF struct {
-	io.ReadCloser
-	d *deadline
-}
-
-func (b *startOnEOF) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	if err == io.EOF {
-		b.d.start()
-	}
-	return n, err
 }
 
 // cancelOnClose releases the request's context when the response body is closed.
