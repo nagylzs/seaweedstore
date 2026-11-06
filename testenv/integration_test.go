@@ -568,6 +568,40 @@ func newCluster(t *testing.T, interval time.Duration) *seaweedstore.Cluster {
 	return newClusterOpts(t, seaweedstore.Options{StatusUpdateInterval: interval})
 }
 
+// A cluster that knows only a follower can't find the leader. With all the masters, it finds it.
+func TestSetMasters(t *testing.T) {
+	cluster(t, "up")
+	l := currentLeader(t)
+	follower := masters[(slices.Index(masters, l)+1)%len(masters)]
+	opts := seaweedstore.Options{StatusUpdateInterval: time.Hour, Logger: slog.New(slog.DiscardHandler)}
+	c, err := seaweedstore.NewCluster(opts, follower.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if got, err := c.Leader(); !errors.Is(err, seaweedstore.ErrNoLeader) {
+		t.Fatalf("Leader() with a follower = %s, %v", got, err)
+	}
+	var addrs []string
+	for _, m := range masters {
+		addrs = append(addrs, m.addr)
+	}
+	if err := c.SetMasters(addrs...); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WaitUntilReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := c.Leader(); err != nil || got != l.addr {
+		t.Errorf("Leader() = %s, %v, want %s", got, err, l.addr)
+	}
+	if _, err := c.Assign(ctx, seaweedstore.AssignOptions{}); err != nil {
+		t.Errorf("Assign: %v", err)
+	}
+}
+
 // newClusterOpts is newCluster with options, to which it adds the logger and the timeouts.
 func newClusterOpts(t *testing.T, opts seaweedstore.Options) *seaweedstore.Cluster {
 	t.Helper()

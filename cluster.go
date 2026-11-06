@@ -37,13 +37,14 @@ const (
 type Cluster struct {
 	options Options
 	client  *http.Client
-	masters []master // never changes
 	ctx     context.Context
 	cancel  context.CancelFunc // cancels ctx; called by Close
 	done    chan struct{}      // closed when the status updates have stopped; nil if they never started
 	ready   chan struct{}      // closed after the first complete status update
+	wake    chan struct{}      // asks for a status update now, without waiting for the next one
 
 	mu         sync.Mutex
+	masters    []master                 // SetMasters replaces it, and never changes it in place
 	leaderIdx  int                      // index in masters, -1 if there is no leader
 	volumes    map[int][]VolumeLocation // volume id -> locations, from the last complete status update
 	statusTime time.Time                // when the last complete status update finished
@@ -55,18 +56,26 @@ type Cluster struct {
 // status in the background: every Options.StatusUpdateInterval, and a second after a failed update,
 // until Close. Call WaitUntilReady to wait for the first update.
 func NewCluster(opts Options, masters ...string) (*Cluster, error) {
-	if len(masters) == 0 {
-		return nil, errors.New("seaweedstore: no masters")
-	}
-	for _, m := range masters {
-		if host, port, err := net.SplitHostPort(m); err != nil || host == "" || !onlyOf(port, "0123456789") {
-			return nil, fmt.Errorf("seaweedstore: invalid master address %q, want host:port", m)
-		}
+	if err := checkMasters(masters); err != nil {
+		return nil, err
 	}
 	c := newCluster(opts, masters...)
 	c.done = make(chan struct{})
 	go c.run()
 	return c, nil
+}
+
+// checkMasters checks the addresses of masters.
+func checkMasters(masters []string) error {
+	if len(masters) == 0 {
+		return errors.New("seaweedstore: no masters")
+	}
+	for _, m := range masters {
+		if host, port, err := net.SplitHostPort(m); err != nil || host == "" || !onlyOf(port, "0123456789") {
+			return fmt.Errorf("seaweedstore: invalid master address %q, want host:port", m)
+		}
+	}
+	return nil
 }
 
 // newCluster returns a cluster without starting the status updates.
@@ -87,6 +96,7 @@ func newCluster(opts Options, masters ...string) *Cluster {
 		options:   opts,
 		client:    opts.HTTPClient,
 		ready:     make(chan struct{}),
+		wake:      make(chan struct{}, 1),
 		leaderIdx: -1,
 		volumes:   make(map[int][]VolumeLocation),
 		failedAt:  make(map[string]time.Time),
@@ -95,10 +105,16 @@ func newCluster(opts Options, masters ...string) *Cluster {
 		c.client = defaultClient()
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
-	for _, m := range masters {
-		c.masters = append(c.masters, master{addr: m})
-	}
+	c.masters = masterList(masters)
 	return c
+}
+
+func masterList(addrs []string) []master {
+	masters := make([]master, 0, len(addrs))
+	for _, addr := range addrs {
+		masters = append(masters, master{addr: addr})
+	}
+	return masters
 }
 
 // defaultClient returns the client for a nil Options.HTTPClient: one on a copy of http.DefaultTransport
@@ -130,9 +146,44 @@ func (c *Cluster) run() {
 		case <-c.ctx.Done():
 			return
 		case <-time.After(wait):
+		case <-c.wake:
 		}
 	}
 }
+
+// SetMasters replaces the masters, for a cluster whose masters change while the program runs. It returns an error if
+// there are none or an address is not host:port, and then nothing changes. The leader stays if it is one of them, and a
+// status update starts right away in the background. A request in progress goes on with the masters that it has started
+// with.
+func (c *Cluster) SetMasters(masters ...string) error {
+	if err := c.closed(); err != nil {
+		return err
+	}
+	if err := checkMasters(masters); err != nil {
+		return err
+	}
+	list := masterList(masters)
+	c.mu.Lock()
+	changed := !slices.Equal(list, c.masters)
+	if changed {
+		leader := -1
+		if c.leaderIdx >= 0 {
+			leader = slices.Index(list, c.masters[c.leaderIdx])
+		}
+		c.masters, c.leaderIdx = list, leader
+	}
+	c.mu.Unlock()
+	if changed {
+		select {
+		case c.wake <- struct{}{}:
+		default: // one is due already
+		}
+	}
+	return nil
+}
+
+// Done returns a channel that is closed by Close.
+func (c *Cluster) Done() <-chan struct{} { return c.ctx.Done() }
 
 // Close stops the status updates, cancelling one in progress, and waits until they have stopped.
 // Requests in progress go on, but new ones return ErrClosed. It closes the unused connections of the
@@ -205,10 +256,13 @@ func (c *Cluster) updateStatus(ctx context.Context) (err error) {
 	}()
 	ctx2, cancel2 := context.WithTimeout(ctx, c.options.StatusUpdateInterval)
 	defer cancel2()
-	statuses := make([]clusterStatus, len(c.masters))
-	errs := make([]error, len(c.masters))
+	c.mu.Lock()
+	masters := c.masters // SetMasters may replace them during the update
+	c.mu.Unlock()
+	statuses := make([]clusterStatus, len(masters))
+	errs := make([]error, len(masters))
 	var wg sync.WaitGroup
-	for idx, m := range c.masters {
+	for idx, m := range masters {
 		wg.Go(func() {
 			errs[idx] = c.getJSON(ctx2, m, "/cluster/status", &statuses[idx])
 			if errs[idx] != nil {
@@ -220,17 +274,20 @@ func (c *Cluster) updateStatus(ctx context.Context) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err // not an answer from the masters
 	}
-	for idx, m := range c.masters {
+	for idx, m := range masters {
 		c.setReachable(m.addr, reached(errs[idx]))
 	}
 	// select leader
 	lIdx := slices.IndexFunc(statuses, func(s clusterStatus) bool { return s.IsLeader })
 	c.mu.Lock()
-	c.leaderIdx = lIdx
+	c.leaderIdx = -1
+	if lIdx >= 0 {
+		c.leaderIdx = slices.Index(c.masters, masters[lIdx])
+	}
 	c.mu.Unlock()
 	if lIdx == -1 {
-		reasons := make([]string, len(c.masters))
-		for idx, m := range c.masters {
+		reasons := make([]string, len(masters))
+		for idx, m := range masters {
 			reasons[idx] = m.addr + ": not the leader"
 			if errs[idx] != nil {
 				reasons[idx] = m.addr + ": " + errs[idx].Error()
@@ -240,7 +297,7 @@ func (c *Cluster) updateStatus(ctx context.Context) (err error) {
 	}
 
 	// get cluster info
-	leader := c.masters[lIdx]
+	leader := masters[lIdx]
 	ctx3, cancel3 := context.WithTimeout(ctx, c.options.StatusUpdateInterval)
 	defer cancel3()
 	var vs volumeStatus
@@ -287,8 +344,10 @@ func (c *Cluster) Leader() (string, error) {
 	return c.masters[c.leaderIdx].addr, nil
 }
 
-// Masters returns the addresses of the masters, in the order given to NewCluster.
+// Masters returns the addresses of the masters, in the order given to NewCluster or SetMasters.
 func (c *Cluster) Masters() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	addrs := make([]string, len(c.masters))
 	for idx, m := range c.masters {
 		addrs[idx] = m.addr

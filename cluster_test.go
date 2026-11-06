@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -301,6 +302,184 @@ func TestUnreachableMasterLast(t *testing.T) {
 	if order := c.masterOrder(); order[0].addr != follower.addr() {
 		t.Errorf("the masters are asked in the order %v", order)
 	}
+}
+
+// New masters are used right away: a status update starts without waiting for the next one, and the old ones aren't asked
+// anymore.
+func TestSetMasters(t *testing.T) {
+	old, leader, follower := newMaster(t, false), newMaster(t, true), newMaster(t, false)
+	opts := quietOptions()
+	opts.StatusUpdateInterval = time.Hour
+	c := startCluster(t, opts, old.addr())
+	waitUntil(t, "the first update", func() bool { return len(old.requestsTo("/cluster/status")) > 0 })
+	if _, err := c.Leader(); !errors.Is(err, ErrNoLeader) {
+		t.Fatalf("Leader with a follower only: %v", err)
+	}
+	if err := c.SetMasters(follower.addr(), leader.addr()); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Masters(); !slices.Equal(got, []string{follower.addr(), leader.addr()}) {
+		t.Errorf("Masters() = %v", got)
+	}
+	waitUntil(t, "the new leader", func() bool {
+		got, err := c.Leader()
+		return err == nil && got == leader.addr()
+	})
+	asked := len(old.requestsTo("/cluster/status"))
+	if err := c.updateStatus(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(old.requestsTo("/cluster/status")); got != asked {
+		t.Errorf("the old master was asked %d more times", got-asked)
+	}
+	for _, m := range c.masterOrder() {
+		if m.addr == old.addr() {
+			t.Errorf("the requests can go to the old master: %v", c.masterOrder())
+		}
+	}
+}
+
+// The same masters are nothing to do, and the status update stays when it is due.
+func TestSetMastersUnchanged(t *testing.T) {
+	leader := newMaster(t, true)
+	c := readyCluster(t, quietOptions(), leader)
+	asked := len(leader.requestsTo("/cluster/status"))
+	if err := c.SetMasters(leader.addr()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c.wake:
+		t.Error("the same masters ask for a status update")
+	default:
+	}
+	if got := len(leader.requestsTo("/cluster/status")); got != asked {
+		t.Errorf("%d more requests", got-asked)
+	}
+}
+
+// The leader stays if it is among the new masters, also at another place, and goes if it isn't.
+func TestSetMastersLeader(t *testing.T) {
+	follower, leader, other := newMaster(t, false), newMaster(t, true), newMaster(t, false)
+	c := newTestCluster(t, quietOptions(), follower.addr(), leader.addr())
+	if err := c.updateStatus(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetMasters(leader.addr(), other.addr(), follower.addr()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := c.Leader(); err != nil || got != leader.addr() {
+		t.Errorf("Leader() at another place = %s, %v", got, err)
+	}
+	if err := c.SetMasters(other.addr(), follower.addr()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Leader(); !errors.Is(err, ErrNoLeader) {
+		t.Errorf("Leader() without the leader: %v", err)
+	}
+	// Only the leader was removed from the order too.
+	if order := c.masterOrder(); len(order) != 2 || order[0].addr != other.addr() {
+		t.Errorf("the masters are asked in the order %v", order)
+	}
+}
+
+// Wrong addresses change nothing.
+func TestSetMastersInvalid(t *testing.T) {
+	leader := newMaster(t, true)
+	c := readyCluster(t, quietOptions(), leader)
+	for _, masters := range [][]string{nil, {"no-port"}, {leader.addr(), ":9333"}, {"host:port"}} {
+		if err := c.SetMasters(masters...); err == nil {
+			t.Errorf("SetMasters(%q) returned no error", masters)
+		}
+	}
+	if got := c.Masters(); !slices.Equal(got, []string{leader.addr()}) {
+		t.Errorf("Masters() = %v", got)
+	}
+	if got, err := c.Leader(); err != nil || got != leader.addr() {
+		t.Errorf("Leader() = %s, %v", got, err)
+	}
+}
+
+// After Close, SetMasters returns ErrClosed, and Done is closed.
+func TestSetMastersClosed(t *testing.T) {
+	leader := newMaster(t, true)
+	c := startCluster(t, quietOptions(), leader.addr())
+	select {
+	case <-c.Done():
+		t.Error("Done is closed before Close")
+	default:
+	}
+	c.Close()
+	if err := c.SetMasters(leader.addr()); !errors.Is(err, ErrClosed) {
+		t.Errorf("SetMasters after Close: %v", err)
+	}
+	select {
+	case <-c.Done():
+	default:
+		t.Error("Done isn't closed after Close")
+	}
+}
+
+// A status update that started with other masters doesn't make one of them the leader.
+func TestSetMastersDuringUpdate(t *testing.T) {
+	old, other := newMaster(t, true), newMaster(t, false)
+	// Between its answer and the end of the update, the masters change.
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cluster/status" {
+			close(entered)
+			<-release
+		}
+		old.serve(w, r)
+	}))
+	t.Cleanup(slow.Close)
+	c := newTestCluster(t, quietOptions(), slow.Listener.Addr().String())
+	done := make(chan error)
+	go func() { done <- c.updateStatus(context.Background()) }()
+	<-entered
+	if err := c.SetMasters(other.addr()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got, err := c.Leader(); !errors.Is(err, ErrNoLeader) {
+		t.Errorf("Leader() = %s, %v, after an update with the old masters", got, err)
+	}
+}
+
+// The masters can change while requests and status updates go on.
+func TestSetMastersConcurrent(t *testing.T) {
+	a, b := newMaster(t, true), newMaster(t, false)
+	opts := quietOptions()
+	opts.StatusUpdateInterval = time.Millisecond
+	c := startCluster(t, opts, a.addr())
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = c.Leader()
+				_ = c.Masters()
+				_ = c.masterOrder()
+			}
+		}
+	})
+	for i := range 200 {
+		list := []string{a.addr(), b.addr()}
+		if i%2 == 1 {
+			list = list[1:]
+		}
+		if err := c.SetMasters(list...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	wg.Wait()
 }
 
 // The volume status is indexed by volume id. A volume with copies on several volume servers has a

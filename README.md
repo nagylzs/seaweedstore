@@ -133,6 +133,9 @@ avoids this by closing unused connections first. If you set `HTTPClient`, or giv
 * `ServeFile(w, r, fid)` - serve a file to an HTTP client (see below).
 * `LookupVolume(ctx, volumeID)` - the volume servers that have a copy of a volume.
 * `Leader()`, `Masters()`, `StatusTime()` - what the last status update found.
+* `SetMasters(masters...)` - replace the masters, when they change while the program runs. The leader stays if it is
+  one of them, and a status update starts right away. `Done()` tells when the cluster is closed, for a goroutine that
+  keeps the masters up to date.
 
 All methods are safe for concurrent use.
 
